@@ -197,6 +197,15 @@ class GraphClient:
         path = f"/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}/children"
         yield from self.paged_get(path, params={"$select": select, "$top": 999})
 
+    def drive_delta_page(self, drive_id: str, next_url: str | None = None, delta_url: str | None = None) -> dict[str, Any]:
+        select = "id,name,size,folder,file,package,root,parentReference,createdDateTime,lastModifiedDateTime,lastAccessedDateTime,webUrl,deleted"
+        if next_url:
+            return self.get(next_url)
+        if delta_url:
+            return self.get(delta_url)
+        path = f"/drives/{quote(drive_id, safe='')}/root/delta"
+        return self.get(path, params={"$select": select, "$top": 999})
+
     def list_users(self) -> Iterator[dict[str, Any]]:
         yield from self.paged_get("/users", params={"$select": "id,displayName,userPrincipalName", "$top": 999})
 

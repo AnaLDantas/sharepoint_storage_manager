@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("crawl", help="Executa descoberta de sites/drives e processa fila completa")
     sub.add_parser("resume", help="Continua uma coleta interrompida usando checkpoint SQLite")
+    sub.add_parser("crawl-delta", help="Executa descoberta e sincroniza drives via delta com checkpoint por pagina")
+    sub.add_parser("resume-delta", help="Continua sincronizacao delta usando nextLink/deltaLink salvos")
     sub.add_parser("retry-errors", help="Reprocessa erros retryable e volta a consumir a fila")
     export = sub.add_parser("export", help="Exporta inventario e relatorios")
     export.add_argument("--format", choices=["csv", "parquet", "all"], default="csv")
@@ -83,6 +85,60 @@ def crawl(command: str) -> int:
     except Exception:
         status = "failed"
         LOGGER.exception("Execucao falhou")
+        return 1
+    finally:
+        stats = db.stats()
+        stats.update(
+            {
+                "duration_seconds": round(time.monotonic() - start, 2),
+                "graph_429": graph.throttle_count,
+                "graph_retries": graph.retry_count,
+            }
+        )
+        db.finish_run(run_id, status, stats)
+        LOGGER.info("Estatisticas finais: %s", stats)
+
+
+def crawl_delta(command: str) -> int:
+    from crawler import InventoryCrawler, install_signal_handlers
+    from database import InventoryDatabase
+    from graph_client import GraphClient
+
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    db = InventoryDatabase(settings.sqlite_db_path)
+    db.init_schema()
+    db.reset_interrupted_work()
+    graph = GraphClient(settings)
+    crawler = InventoryCrawler(graph, db, settings.max_workers, settings.progress_log_interval_seconds)
+    install_signal_handlers(crawler)
+    run_id = db.start_run(command)
+    start = time.monotonic()
+    status = "success"
+    try:
+        if command == "crawl-delta":
+            site_ids = list(settings.site_ids) + _load_lines(settings.site_ids_file)
+            discovered_site_ids: list[str] | None = None
+            if site_ids:
+                LOGGER.info("Coleta delta limitada a %s Site IDs", len(site_ids))
+                discovered_site_ids = crawler.discover_sharepoint_by_site_ids(site_ids, enqueue_roots=False)
+            else:
+                crawler.discover_sharepoint(settings.site_search_query, enqueue_roots=False)
+            if settings.enable_user_onedrive:
+                user_site_ids = crawler.discover_user_onedrives(enqueue_roots=False)
+                if discovered_site_ids is not None:
+                    discovered_site_ids.extend(user_site_ids)
+            crawler.process_delta_drives(
+                reset_completed=True,
+                site_ids=set(discovered_site_ids) if discovered_site_ids is not None else None,
+            )
+        else:
+            crawler.process_delta_drives(reset_completed=False)
+        db.recalculate_folder_aggregates()
+        return 0
+    except Exception:
+        status = "failed"
+        LOGGER.exception("Execucao delta falhou")
         return 1
     finally:
         stats = db.stats()
@@ -178,6 +234,8 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command in {"crawl", "resume"}:
         return crawl(args.command)
+    if args.command in {"crawl-delta", "resume-delta"}:
+        return crawl_delta(args.command)
     if args.command == "retry-errors":
         return retry_errors()
     if args.command == "export":

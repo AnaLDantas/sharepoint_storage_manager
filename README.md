@@ -7,13 +7,18 @@ Aplicacao Python para catalogar sites, bibliotecas, pastas e arquivos de um tena
 - Autenticacao por Azure App Registration com `TENANT_ID`, `CLIENT_ID` e `CLIENT_SECRET`.
 - Descoberta de sites do SharePoint Online e drives/bibliotecas.
 - Opcionalmente, descoberta de OneDrive for Business por usuario.
+- Sincronizacao otimizada por drive usando Microsoft Graph `/root/delta`.
+- Checkpoint por pagina delta com `@odata.nextLink` e `@odata.deltaLink`.
 - Fila local de pastas em SQLite para retomar coletas interrompidas.
 - Paginacao por `@odata.nextLink`.
 - Retry para 408, 429, 500, 502, 503 e 504.
 - Respeito ao header `Retry-After` em HTTP 429 e exponential backoff quando o header nao vem.
 - Concorrencia limitada por `MAX_WORKERS`.
+- Reducao temporaria de concorrencia no modo delta quando ha retries/throttling.
+- Gravacao em lote por pagina/pasta no SQLite.
 - Exportacao CSV e Parquet.
 - Resumos por extensao e por pasta.
+- Analise exploratoria do Parquet com DuckDB em notebook.
 
 ## Estrutura
 
@@ -25,6 +30,10 @@ database.py
 crawler.py
 exporter.py
 models.py
+priority.py
+notebooks/analyze_inventory_parquet_duckdb.ipynb
+inventory/sharepoint_inventory.sqlite3
+exports/
 requirements.txt
 .env.example
 README.md
@@ -39,6 +48,12 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+Para usar o notebook de analise do Parquet, instale tambem as dependencias exploratorias:
+
+```bash
+python -m pip install duckdb pandas pyarrow jupyter
+```
+
 Edite o arquivo `.env`:
 
 ```env
@@ -47,9 +62,12 @@ CLIENT_ID=seu-client-id
 CLIENT_SECRET=seu-client-secret
 MAX_WORKERS=4
 REQUEST_TIMEOUT=60
-SQLITE_DB_PATH=./sharepoint_inventory.sqlite3
+SQLITE_DB_PATH=./inventory/sharepoint_inventory.sqlite3
 EXPORT_PATH=./exports
 LOG_LEVEL=INFO
+GRAPH_PAGE_SIZE=999
+STORE_RAW_JSON=false
+CALCULATE_FOLDER_AGGREGATES_ON_CRAWL=false
 PROGRESS_LOG_INTERVAL_SECONDS=60
 ENABLE_USER_ONEDRIVE=false
 SITE_SEARCH_QUERY=*
@@ -84,11 +102,21 @@ Gerar ranking de prioridade dos sites por armazenamento usado:
 python main.py prioritize-sites --period D180
 ```
 
+Esse comando usa o relatorio Microsoft Graph `getSharePointSiteUsageDetail` e requer a permissao Application `Reports.Read.All`. Ele nao varre arquivo por arquivo; baixa o relatorio de uso do Microsoft 365 e gera arquivos em `exports/` com ranking, grupos por faixa de armazenamento e listas de IDs de sites para orientar a coleta.
+
 Executar coleta completa:
 
 ```bash
 python main.py crawl
 ```
+
+Executar coleta otimizada por delta, recomendada para arvores grandes:
+
+```bash
+python main.py crawl-delta
+```
+
+O modo `crawl-delta` descobre sites/drives e sincroniza cada biblioteca por `/drives/{drive-id}/root/delta`. Na primeira execucao, ele enumera a biblioteca completa por paginas. Ao concluir, salva o `@odata.deltaLink`; nas execucoes seguintes, busca somente alteracoes. Durante a carga, cada `@odata.nextLink` e salvo no SQLite, entao uma interrupcao retoma da ultima pagina confirmada.
 
 Executar coleta limitada a uma lista de IDs de sites:
 
@@ -98,6 +126,12 @@ SITE_IDS_FILE=./exports/site_ids_over_1tb.txt
 
 ```bash
 python main.py crawl
+```
+
+Para usar delta com uma lista limitada de sites:
+
+```bash
+python main.py crawl-delta
 ```
 
 Tambem e possivel informar IDs diretamente no `.env`:
@@ -113,6 +147,14 @@ Continuar coleta interrompida:
 ```bash
 python main.py resume
 ```
+
+Continuar coleta delta interrompida:
+
+```bash
+python main.py resume-delta
+```
+
+Use `resume-delta` quando a execucao parou no meio de uma sincronizacao delta e voce quer continuar dos `nextLink`/`deltaLink` ja salvos, sem redescobrir sites.
 
 Reprocessar erros retryable:
 
@@ -144,42 +186,20 @@ Gerar resumo consolidado:
 python main.py summary
 ```
 
-Conferir metadados do SQLite com PySpark:
+Analisar metadados do Parquet em notebook:
 
 ```bash
-.venv/bin/python -m pip install pyspark
-.venv/bin/python scripts/inspect_sqlite_metadata_pyspark.py \
-  --db inventory/sharepoint_inventory.sqlite3 \
-  --sqlite-jdbc-jar ./drivers/sqlite-jdbc.jar
+python main.py export --format parquet
+jupyter notebook notebooks/analyze_inventory_parquet_duckdb.ipynb
 ```
 
-Esse script nao faz novas chamadas ao Microsoft Graph. Ele apenas le o SQLite local e mostra schema, contagens, itens por tipo/status, principais extensoes, bibliotecas por volume, amostra de arquivos e erros em aberto.
+O notebook usa DuckDB para consultar `exports/inventory.parquet` direto no disco. Ele mostra schema, contagens, amostras de arquivos, extensoes mais comuns, bibliotecas por volume, pastas por volume calculado e verificacoes basicas de qualidade dos metadados.
 
-Observacao: para o Spark ler SQLite direto, e necessario ter o driver JDBC do SQLite. Baixe o `sqlite-jdbc` e informe o caminho no parametro `--sqlite-jdbc-jar`. Se o jar ja estiver configurado no ambiente do Spark, o parametro pode ser omitido.
+Se o notebook nao reconhecer `duckdb`, execute a celula de instalacao nele ou instale na venv:
 
-
-
-Esse comando usa o relatorio Microsoft Graph `getSharePointSiteUsageDetail` e requer a permissao Application `Reports.Read.All`. Ele nao varre arquivo por arquivo; baixa o relatorio de uso do Microsoft 365 e gera:
-
-- `exports/site_priority.csv`
-- `exports/site_priority.json`
-- `exports/site_priority_groups.json`
-- `exports/sites_priority_order.txt`
-- `exports/sites_over_1tb.txt`
-- `exports/sites_500gb_to_1tb.txt`
-- `exports/sites_100gb_to_500gb.txt`
-- `exports/sites_under_100gb.txt`
-- `exports/site_ids_priority_order.txt`
-- `exports/site_ids_over_1tb.txt`
-- `exports/site_ids_500gb_to_1tb.txt`
-- `exports/site_ids_100gb_to_500gb.txt`
-- `exports/site_ids_under_100gb.txt`
-- `exports/over_1tb.json`
-- `exports/over_500gb_to_1tb.json`
-- `exports/over_100gb_to_500gb.json`
-- `exports/under_100gb.json`
-
-Depois voce pode usar a lista dos sites maiores para orientar a coleta prioritaria. Em alguns tenants, a coluna `Site URL` do relatorio vem vazia por configuracao de privacidade dos reports; nesse caso, os arquivos `site_ids_*.txt` e os JSONs ainda ficam preenchidos com `Site Id`, tamanho e demais metadados.
+```bash
+python -m pip install duckdb pandas pyarrow jupyter
+```
 
 ## Como o checkpoint funciona
 
@@ -188,11 +208,34 @@ O SQLite guarda tudo que ja foi descoberto e lido:
 - `sites`: sites encontrados.
 - `drives`: bibliotecas/drives encontrados.
 - `items`: arquivos e pastas catalogados.
+- `drive_sync_state`: estado delta por drive, incluindo `next_link`, `delta_link`, status, tentativas e ultimo erro.
 - `folders_queue`: fila de pastas pendentes, em andamento, concluidas ou com falha.
 - `errors`: falhas para auditoria e reprocessamento.
 - `runs`: historico de execucoes.
 
 Uma pasta so e marcada como `done` depois que todos os seus filhos foram lidos e gravados. Se o processo parar no meio, pastas `in_progress` voltam para `pending` no proximo `crawl` ou `resume`. Como `items` usa chave primaria `(drive_id, id)`, reler uma pasta nao duplica registros: os itens existentes sao atualizados.
+
+No modo delta, o checkpoint fica em `drive_sync_state`:
+
+- `next_link`: proxima pagina da carga atual. E atualizado depois que a pagina foi gravada no SQLite.
+- `delta_link`: token final de sincronizacao. E salvo quando o drive termina a enumeracao.
+- `status`: `pending`, `in_progress`, `done` ou `failed`.
+- Se o processo parar, drives `in_progress` voltam para `pending` no proximo `resume-delta`.
+- Se o Graph retornar token delta expirado/invalido, o drive limpa `next_link`/`delta_link` e refaz carga completa na proxima tentativa.
+- Itens removidos retornados pelo delta sao marcados como `deleted` no SQLite e ficam fora das exportacoes e dos resumos.
+
+## Como o modo delta funciona
+
+1. O script descobre sites e drives normalmente.
+2. Cada drive entra em `drive_sync_state`.
+3. Um worker pega um drive `pending`.
+4. Se existe `next_link`, continua a pagina interrompida.
+5. Se existe `delta_link`, busca somente alteracoes desde a ultima conclusao.
+6. Se nao existe token salvo, inicia `/drives/{drive-id}/root/delta`.
+7. Cada pagina grava itens em lote no SQLite e atualiza `next_link`.
+8. Quando o Graph retorna `@odata.deltaLink`, o drive vira `done`.
+
+Esse e o caminho recomendado para sites com arvores muito grandes, porque evita uma chamada por pasta e reduz retrabalho entre execucoes.
 
 ## Como a fila de pastas funciona
 
@@ -205,7 +248,7 @@ Uma pasta so e marcada como `done` depois que todos os seus filhos foram lidos e
 7. Grava pastas em `items` e tambem em `folders_queue`.
 8. Marca a pasta atual como `done`.
 
-Esse modelo evita carregar a arvore inteira em memoria.
+Esse modelo evita carregar a arvore inteira em memoria e permanece disponivel como fallback para casos em que o delta nao seja adequado.
 
 ## Controle de HTTP 429
 
@@ -217,12 +260,13 @@ O Microsoft Graph pode responder `429 Too Many Requests`. O cliente:
 - Se nao houver `Retry-After`, usa exponential backoff com jitter.
 - Limita o numero de tentativas.
 - Conta throttles e retries nas estatisticas finais.
+- No modo delta, se uma janela de trabalho gerar retries/throttles, a concorrencia efetiva e reduzida temporariamente.
 
-Evite concorrencia alta. Em ambientes com dezenas de TB, e normal a coleta durar horas ou dias.
+Evite concorrencia alta. Em ambientes com dezenas de TB, comece com `MAX_WORKERS=2` ou `4`. O modo delta reduz o numero total de chamadas e o retrabalho, mas nao elimina throttling do Microsoft Graph.
 
 ## Paginacao
 
-Todas as colecoes do Graph sao lidas em streaming por pagina. O script segue `@odata.nextLink` ate o fim da colecao e grava cada item no SQLite conforme ele chega.
+Todas as colecoes do Graph sao lidas em streaming por pagina. O script segue `@odata.nextLink` ate o fim da colecao. No modo delta, cada pagina e gravada em lote e o `nextLink` e salvo como checkpoint antes de seguir.
 
 ## Calculo de volume de diretorios
 
@@ -289,7 +333,8 @@ para reprocessar falhas marcadas como retryable.
 
 ## Limitacoes conhecidas do Microsoft Graph
 
-- A API de `children` lista filhos imediatos; a recursao e feita pelo script.
+- O modo delta usa `/root/delta` por drive e e recomendado para arvores grandes.
+- A API de `children` lista filhos imediatos; a recursao por pasta continua disponivel como fallback.
 - Nem todos os tenants/itens retornam `lastAccessedDateTime`.
 - Metadados podem variar conforme tipo de drive, biblioteca, politica do tenant e permissao concedida.
 - Para extracoes massivas de dados Microsoft 365, a Microsoft recomenda avaliar Microsoft Graph Data Connect quando aplicavel, pois cargas muito grandes podem sofrer throttling na API REST.
@@ -300,17 +345,19 @@ para reprocessar falhas marcadas como retryable.
 - Microsoft Graph throttling: https://learn.microsoft.com/en-us/graph/throttling
 - Microsoft Graph service-specific throttling limits: https://learn.microsoft.com/en-us/graph/throttling-limits
 - List children of a driveItem: https://learn.microsoft.com/en-us/graph/api/driveitem-list-children
+- driveItem delta: https://learn.microsoft.com/en-us/graph/api/driveitem-delta
 - Microsoft Graph permissions reference: https://learn.microsoft.com/en-us/graph/permissions-reference
 - SharePoint Online throttling guidance: https://learn.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online
 
 ## Boas praticas para 22 TB / milhoes de arquivos
 
 - Rode em uma VM/servidor estavel, com disco local rapido para o SQLite.
-- Use `MAX_WORKERS` baixo no inicio.
+- Use `MAX_WORKERS` baixo no inicio, especialmente em `crawl-delta`.
 - Monitore logs de 429 e retries.
 - Faca backup periodico do arquivo `.sqlite3` se a execucao durar varios dias.
 - Execute exportacoes depois da coleta ou em janelas de baixa atividade.
-- Nao apague o SQLite entre `resume`.
+- Nao apague o SQLite entre `resume` ou `resume-delta`.
+- Para sites gigantes, rode primeiro `prioritize-sites` e use os arquivos `site_ids_*` com `crawl-delta`.
 
 
 ## Melhorias futuras

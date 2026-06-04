@@ -38,6 +38,7 @@ SELECT
 FROM items i
 JOIN sites s ON s.id = i.site_id
 JOIN drives d ON d.id = i.drive_id
+WHERE i.status!='deleted'
 ORDER BY s.web_url, d.name, i.full_path
 """
 
@@ -54,6 +55,7 @@ SELECT
 FROM items i
 JOIN sites s ON s.id = i.site_id
 JOIN drives d ON d.id = i.drive_id
+WHERE i.status!='deleted'
 GROUP BY s.name, s.web_url, d.name, extensao, i.item_type
 ORDER BY s.web_url, d.name, i.item_type, extensao
 """
@@ -73,6 +75,7 @@ FROM items i
 JOIN sites s ON s.id = i.site_id
 JOIN drives d ON d.id = i.drive_id
 WHERE i.item_type='folder'
+AND i.status!='deleted'
 ORDER BY s.web_url, d.name, i.full_path
 """
 
@@ -152,9 +155,9 @@ def print_summary(db_path: Path) -> dict[str, Any]:
                 SELECT
                     (SELECT COUNT(*) FROM sites) sites,
                     (SELECT COUNT(*) FROM drives) drives,
-                    (SELECT COUNT(*) FROM items WHERE item_type='folder') folders,
-                    (SELECT COUNT(*) FROM items WHERE item_type='file') files,
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE item_type='file') total_bytes,
+                    (SELECT COUNT(*) FROM items WHERE item_type='folder' AND status!='deleted') folders,
+                    (SELECT COUNT(*) FROM items WHERE item_type='file' AND status!='deleted') files,
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE item_type='file' AND status!='deleted') total_bytes,
                     (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors
                 """
             ).fetchone()

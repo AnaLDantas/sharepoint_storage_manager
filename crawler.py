@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -73,6 +72,18 @@ def _item_from_graph(
     )
 
 
+def _path_from_parent_reference(root_path: str, row: dict[str, Any]) -> str:
+    parent = row.get("parentReference") or {}
+    parent_path = parent.get("path") or ""
+    if not parent_path:
+        return ""
+    marker = "root:"
+    if marker not in parent_path:
+        return root_path
+    suffix = parent_path.split(marker, 1)[1].strip("/")
+    return f"{root_path.rstrip('/')}/{suffix}" if suffix else root_path
+
+
 class InventoryCrawler:
     """Orquestra descoberta de sites/drives e consumo da fila de pastas."""
 
@@ -89,7 +100,7 @@ class InventoryCrawler:
         self.progress_log_interval_seconds = max(10, progress_log_interval_seconds)
         self._stop = threading.Event()
 
-    def discover_sharepoint_by_site_ids(self, site_ids: list[str]) -> None:
+    def discover_sharepoint_by_site_ids(self, site_ids: list[str], enqueue_roots: bool = True) -> list[str]:
         """Descobre sites especificos por ID, preservando a ordem recebida.
 
         O report de uso pode trazer apenas o GUID do SharePoint, enquanto o Graph
@@ -97,6 +108,7 @@ class InventoryCrawler:
         se necessario, criamos um de/para com /sites?search=*.
         """
         site_map: dict[str, dict[str, Any]] | None = None
+        discovered_site_ids: list[str] = []
         for site_id in site_ids:
             try:
                 site_row = self.graph.get_site(site_id)
@@ -112,13 +124,20 @@ class InventoryCrawler:
                     self.db.record_error("site", "resolve_site_id", f"Site ID nao encontrado no Graph: {site_id}", site_id, site_id=site_id, status_code=404, retryable=False)
                     LOGGER.warning("Site ID nao encontrado no Graph: %s", site_id)
                     continue
-            self._discover_single_site(site_row)
+            discovered_site_id = self._discover_single_site(site_row, enqueue_roots=enqueue_roots)
+            if discovered_site_id:
+                discovered_site_ids.append(discovered_site_id)
+        return discovered_site_ids
 
-    def discover_sharepoint(self, search_query: str = "*") -> None:
+    def discover_sharepoint(self, search_query: str = "*", enqueue_roots: bool = True) -> list[str]:
+        discovered_site_ids: list[str] = []
         for site_row in self.graph.list_sites(search_query):
-            self._discover_single_site(site_row)
+            discovered_site_id = self._discover_single_site(site_row, enqueue_roots=enqueue_roots)
+            if discovered_site_id:
+                discovered_site_ids.append(discovered_site_id)
+        return discovered_site_ids
 
-    def _discover_single_site(self, site_row: dict[str, Any]) -> None:
+    def _discover_single_site(self, site_row: dict[str, Any], enqueue_roots: bool = True) -> str | None:
         site = _site_from_graph(site_row)
         self.db.upsert_site(site)
         LOGGER.info("Site descoberto: %s", site.web_url or site.id)
@@ -126,11 +145,14 @@ class InventoryCrawler:
             for drive_row in self.graph.list_site_drives(site.id):
                 drive = _drive_from_graph(site.id, drive_row)
                 self.db.upsert_drive(drive)
-                self._enqueue_drive_root(site, drive)
+                if enqueue_roots:
+                    self._enqueue_drive_root(site, drive)
             self.db.mark_site_processed(site.id)
+            return site.id
         except GraphError as exc:
             self.db.record_error("site", "list_site_drives", exc.message, site.id, site_id=site.id, status_code=exc.status_code, retryable=exc.status_code != 403)
             LOGGER.exception("Erro ao listar drives do site %s", site.id)
+            return None
 
     def _build_site_id_map(self) -> dict[str, dict[str, Any]]:
         LOGGER.info("Criando de/para de Site ID via /sites?search=*")
@@ -149,7 +171,8 @@ class InventoryCrawler:
                     site_map[str(value).lower()] = site_row
         return site_map
 
-    def discover_user_onedrives(self) -> None:
+    def discover_user_onedrives(self, enqueue_roots: bool = True) -> list[str]:
+        discovered_site_ids: list[str] = []
         for user in self.graph.list_users():
             site = SiteRecord(
                 id=f"user:{user['id']}",
@@ -163,10 +186,13 @@ class InventoryCrawler:
                 drive_row = self.graph.get_user_drive(user["id"])
                 drive = _drive_from_graph(site.id, drive_row)
                 self.db.upsert_drive(drive)
-                self._enqueue_drive_root(site, drive)
+                if enqueue_roots:
+                    self._enqueue_drive_root(site, drive)
                 self.db.mark_site_processed(site.id)
+                discovered_site_ids.append(site.id)
             except GraphError as exc:
                 self.db.record_error("user", "get_user_drive", exc.message, user["id"], site_id=site.id, status_code=exc.status_code, retryable=exc.status_code not in {403, 404})
+        return discovered_site_ids
 
     def _enqueue_drive_root(self, site: SiteRecord, drive: DriveRecord) -> None:
         try:
@@ -237,11 +263,13 @@ class InventoryCrawler:
         files = int(stats.get("files") or 0)
         folders = int(stats.get("folders") or 0)
         queue = stats.get("queue") or {}
+        delta = stats.get("delta") or {}
         files_per_minute = (files - previous_files) / interval_minutes
         folders_per_minute = (folders - previous_folders) / interval_minutes
         LOGGER.info(
             "%sprogresso: sites=%s drives=%s arquivos=%s pastas=%s pendentes=%s em_andamento=%s concluidas=%s "
-            "volume=%s erros=%s checkpoint=%s tempo=%.1fmin arquivos/min=%.1f pastas/min=%.1f 429=%s retries=%s",
+            "delta_pendentes=%s delta_em_andamento=%s delta_concluidos=%s volume=%s erros=%s checkpoint=%s "
+            "tempo=%.1fmin arquivos/min=%.1f pastas/min=%.1f 429=%s retries=%s",
             "final " if final else "",
             stats.get("sites"),
             stats.get("drives"),
@@ -250,6 +278,9 @@ class InventoryCrawler:
             queue.get("pending", 0),
             queue.get("in_progress", 0),
             queue.get("done", 0),
+            delta.get("pending", 0),
+            delta.get("in_progress", 0),
+            delta.get("done", 0),
             stats.get("total_formatted"),
             stats.get("open_errors"),
             stats.get("last_checkpoint"),
@@ -261,10 +292,134 @@ class InventoryCrawler:
         )
         return files, folders
 
+    def process_delta_drives(self, reset_completed: bool = False, site_ids: set[str] | None = None) -> None:
+        """Sincroniza drives via /root/delta com checkpoint por pagina.
+
+        O estado fica em drive_sync_state. Cada pagina gravada atualiza next_link;
+        ao fim da enumeracao, delta_link permite execucoes seguintes incrementais.
+        """
+        self.db.prepare_delta_sync(reset_completed=reset_completed, site_ids=site_ids)
+        started_at = time.monotonic()
+        last_progress_at = started_at
+        last_files = 0
+        last_folders = 0
+        target_workers = self.max_workers
+        cooldown_until = 0.0
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = set()
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if now - last_progress_at >= self.progress_log_interval_seconds:
+                    last_files, last_folders = self._log_progress(started_at, last_progress_at, last_files, last_folders)
+                    last_progress_at = now
+                while len(futures) < target_workers:
+                    drive_state = self.db.claim_delta_drive(site_ids=site_ids)
+                    if not drive_state:
+                        break
+                    futures.add(executor.submit(self._process_delta_drive, drive_state))
+                if not futures:
+                    if self.db.delta_pending_count(site_ids=site_ids) == 0:
+                        break
+                    time.sleep(1)
+                    continue
+                done, futures = wait(futures, timeout=2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    throttles, retries = future.result()
+                    if throttles or retries:
+                        target_workers = max(1, target_workers - 1)
+                        cooldown_until = time.monotonic() + 60
+                        LOGGER.warning(
+                            "Graph aplicou retry/throttle nesta janela. Reduzindo concorrencia delta para %s por enquanto.",
+                            target_workers,
+                        )
+                    elif target_workers < self.max_workers and time.monotonic() >= cooldown_until:
+                        target_workers += 1
+                        LOGGER.info("Concorrencia delta aumentada para %s", target_workers)
+        self._log_progress(started_at, last_progress_at, last_files, last_folders, final=True)
+
+    def _process_delta_drive(self, drive_state: Any) -> tuple[int, int]:
+        drive_id = drive_state["drive_id"]
+        site_id = drive_state["site_id"]
+        library_name = drive_state["library_name"] or drive_id
+        next_link = drive_state["next_link"]
+        delta_link = drive_state["delta_link"]
+        root_path = self.db.drive_root_path(drive_id, library_name)
+        throttle_before = self.graph.throttle_count
+        retry_before = self.graph.retry_count
+        LOGGER.info("Sincronizando delta: drive=%s biblioteca=%s", drive_id, library_name)
+        try:
+            while not self._stop.is_set():
+                page = self.graph.drive_delta_page(drive_id, next_url=next_link, delta_url=None if next_link else delta_link)
+                items: list[ItemRecord] = []
+                deleted_item_ids: list[str] = []
+                for row in page.get("value", []):
+                    item_id = row.get("id")
+                    if not item_id:
+                        continue
+                    if "deleted" in row:
+                        deleted_item_ids.append(item_id)
+                        continue
+                    parent = row.get("parentReference") or {}
+                    parent_id = parent.get("id")
+                    parent_path = _path_from_parent_reference(root_path, row)
+                    if "root" in row:
+                        parent_id = None
+                        parent_path = ""
+                    items.append(
+                        _item_from_graph(
+                            site_id=site_id,
+                            drive_id=drive_id,
+                            library_name=library_name,
+                            parent_id=parent_id,
+                            parent_path=parent_path,
+                            row=row,
+                        )
+                    )
+                next_link = page.get("@odata.nextLink")
+                delta_link = page.get("@odata.deltaLink")
+                self.db.complete_delta_page(drive_id, items, deleted_item_ids, next_link, delta_link)
+                LOGGER.info(
+                    "Delta pagina gravada: drive=%s itens=%s deletados=%s next=%s done=%s",
+                    drive_id,
+                    len(items),
+                    len(deleted_item_ids),
+                    bool(next_link),
+                    bool(delta_link),
+                )
+                if not next_link:
+                    break
+            return self.graph.throttle_count - throttle_before, self.graph.retry_count - retry_before
+        except GraphError as exc:
+            if exc.status_code == 410:
+                self.db.reset_delta_drive(drive_id, "Delta token expirado/invalido. Proxima tentativa fara carga completa.")
+                retryable = True
+            else:
+                retryable = exc.status_code not in {401, 403, 404}
+                self.db.fail_delta_drive(drive_id, exc.message, retryable=retryable)
+            self.db.record_error(
+                "drive",
+                "drive_delta",
+                exc.message,
+                entity_id=drive_id,
+                drive_id=drive_id,
+                site_id=site_id,
+                status_code=exc.status_code,
+                retryable=retryable,
+            )
+            LOGGER.exception("Erro na sincronizacao delta do drive %s", drive_id)
+            return self.graph.throttle_count - throttle_before, self.graph.retry_count - retry_before
+        except Exception as exc:
+            self.db.fail_delta_drive(drive_id, str(exc), retryable=True)
+            self.db.record_error("drive", "drive_delta", str(exc), drive_id, drive_id, site_id, retryable=True)
+            LOGGER.exception("Falha inesperada na sincronizacao delta do drive %s", drive_id)
+            return self.graph.throttle_count - throttle_before, self.graph.retry_count - retry_before
+
     def _process_folder(self, folder: QueueFolder) -> None:
         LOGGER.info("Lendo pasta: drive=%s path=%s", folder.drive_id, folder.path)
         try:
             child_count = 0
+            items: list[ItemRecord] = []
+            folders: list[QueueFolder] = []
             for child in self.graph.list_children(folder.drive_id, folder.item_id):
                 item = _item_from_graph(
                     site_id=folder.site_id,
@@ -274,11 +429,11 @@ class InventoryCrawler:
                     parent_path=folder.path,
                     row=child,
                 )
-                self.db.upsert_item(item)
+                items.append(item)
                 child_count += 1
                 if item.item_type == "folder":
                     full_path = f"{folder.path.rstrip('/')}/{item.name}"
-                    self.db.enqueue_folder(
+                    folders.append(
                         QueueFolder(
                             drive_id=folder.drive_id,
                             item_id=item.id,
@@ -289,6 +444,8 @@ class InventoryCrawler:
                             depth=folder.depth + 1,
                         )
                     )
+            self.db.upsert_items_batch(items)
+            self.db.enqueue_folders_batch(folders)
             self.db.complete_folder(folder.drive_id, folder.item_id)
             LOGGER.info("Pasta concluida: %s (%s filhos)", folder.path, child_count)
         except GraphError as exc:
