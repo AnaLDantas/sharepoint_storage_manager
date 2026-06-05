@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 import duckdb
 import pandas as pd
@@ -10,17 +13,89 @@ import streamlit as st
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-EXPORTS_DIR = ROOT_DIR / "exports"
-INVENTORY_PARQUET = EXPORTS_DIR / "inventory.parquet"
-SITE_PRIORITY_CSV = EXPORTS_DIR / "site_priority.csv"
+CLIENTS_DIR = ROOT_DIR / "clients"
 BYTES_IN_GB = 1024**3
+TOP_SITE_CHART_LIMIT = 10
+SITE_LABEL_MAX_CHARS = 32
 
 
 st.set_page_config(
     page_title="SharePoint Storage Dashboard",
     page_icon=":bar_chart:",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+
+@dataclass(frozen=True)
+class ClientWorkspace:
+    name: str
+    root_dir: Path
+    inventory_parquet: Path
+    site_priority_csv: Path
+    sqlite_db: Path
+
+
+def workspace_from_root(name: str, root_dir: Path) -> ClientWorkspace:
+    return ClientWorkspace(
+        name=name,
+        root_dir=root_dir,
+        inventory_parquet=root_dir / "exports" / "inventory.parquet",
+        site_priority_csv=root_dir / "exports" / "site_priority.csv",
+        sqlite_db=root_dir / "inventory" / "sharepoint_inventory.sqlite3",
+    )
+
+
+def discover_client_workspaces() -> list[ClientWorkspace]:
+    workspaces = [workspace_from_root("Cliente atual", ROOT_DIR)]
+    if CLIENTS_DIR.exists():
+        for client_dir in sorted(path for path in CLIENTS_DIR.iterdir() if path.is_dir()):
+            workspace = workspace_from_root(client_dir.name, client_dir)
+            has_data = (
+                workspace.inventory_parquet.exists()
+                or workspace.site_priority_csv.exists()
+                or workspace.sqlite_db.exists()
+            )
+            if has_data:
+                workspaces.append(workspace)
+    return workspaces
+
+
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            .block-container {
+                padding-top: 2.2rem;
+                padding-bottom: 3rem;
+            }
+
+            [data-testid="stMetric"] {
+                background: rgba(255, 255, 255, 0.035);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 1rem 1.1rem;
+            }
+
+            [data-testid="stMetricLabel"] {
+                color: rgba(250, 250, 250, 0.72);
+            }
+
+            [data-testid="stSidebar"] {
+                border-right: 1px solid rgba(255, 255, 255, 0.08);
+            }
+
+            div[data-testid="stPopover"] button {
+                border-radius: 999px;
+            }
+
+            h1, h2, h3 {
+                letter-spacing: 0;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def format_gb(value: float | int | None) -> str:
@@ -35,27 +110,111 @@ def format_number(value: float | int | None) -> str:
     return f"{int(value):,}".replace(",", ".")
 
 
+def shorten_label(value: str | None, max_chars: int = SITE_LABEL_MAX_CHARS) -> str:
+    if not value or pd.isna(value):
+        return "(sem nome)"
+    text = str(value).strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1]}..."
+
+
+def display_site_name(site_name: str | None, site_url: str | None = None) -> str:
+    name = "" if not site_name or pd.isna(site_name) else str(site_name).strip()
+    url = "" if not site_url or pd.isna(site_url) else str(site_url).strip()
+    if name and "," not in name:
+        return name
+    if url:
+        parsed = urlparse(url)
+        path_name = parsed.path.rstrip("/").split("/")[-1]
+        return path_name or parsed.netloc or name or "(sem nome)"
+    return name or "(sem nome)"
+
+
+def prepare_site_chart_data(df: pd.DataFrame, value_column: str, limit: int = TOP_SITE_CHART_LIMIT) -> pd.DataFrame:
+    chart = df.sort_values(value_column, ascending=False).head(limit).copy()
+    chart["rank"] = range(1, len(chart) + 1)
+    chart["site_display_name"] = chart.apply(
+        lambda row: display_site_name(row.get("site_name"), row.get("site_url")),
+        axis=1,
+    )
+    chart["site_label"] = chart.apply(
+        lambda row: f"{int(row['rank']):02d}. {shorten_label(row['site_display_name'])}",
+        axis=1,
+    )
+    return chart.sort_values(value_column)
+
+
+def site_id_variants(site_id: str | None) -> list[str]:
+    if not site_id or pd.isna(site_id):
+        return []
+    value = str(site_id).strip().lower()
+    if not value:
+        return []
+    parts = [part.strip().lower() for part in value.split(",") if part.strip()]
+    return list(dict.fromkeys([value, *parts]))
+
+
 @st.cache_data(show_spinner=False)
-def load_site_priority() -> pd.DataFrame:
-    if not SITE_PRIORITY_CSV.exists():
+def load_site_url_lookup(sqlite_db: str) -> pd.DataFrame:
+    db_path = Path(sqlite_db)
+    if not db_path.exists():
+        return pd.DataFrame(columns=["site_id", "site_name", "site_url"])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        sites = pd.read_sql_query("SELECT id, name, web_url FROM sites", conn)
+    finally:
+        conn.close()
+
+    rows: list[dict[str, str]] = []
+    for row in sites.itertuples(index=False):
+        for variant in site_id_variants(row.id):
+            rows.append(
+                {
+                    "site_id": variant,
+                    "site_name": row.name or "",
+                    "site_url": row.web_url or "",
+                }
+            )
+    return pd.DataFrame(rows).drop_duplicates("site_id")
+
+
+@st.cache_data(show_spinner=False)
+def load_site_priority(site_priority_csv: str, sqlite_db: str) -> pd.DataFrame:
+    priority_path = Path(site_priority_csv)
+    if not priority_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(SITE_PRIORITY_CSV, encoding="utf-8-sig")
+    df = pd.read_csv(priority_path, encoding="utf-8-sig")
+    df["site_id_lookup"] = df["site_id"].astype(str).str.strip().str.lower()
+
+    lookup = load_site_url_lookup(sqlite_db)
+    if not lookup.empty:
+        df = df.merge(lookup, how="left", left_on="site_id_lookup", right_on="site_id", suffixes=("", "_lookup"))
+        df["site_url"] = df["site_url"].fillna("").astype(str)
+        df["site_url"] = df["site_url"].mask(df["site_url"].isin(["", "nan", "None"]), df["site_url_lookup"].fillna(""))
+        df["site_name"] = df.get("site_name", pd.Series(dtype="object")).fillna("")
+    else:
+        df["site_name"] = ""
+
     if "last_activity_date" in df.columns:
         df["last_activity_date"] = pd.to_datetime(df["last_activity_date"], errors="coerce")
     if "storage_used_bytes" in df.columns:
         df["storage_used_gb"] = df["storage_used_bytes"] / BYTES_IN_GB
+    df = df.drop(columns=[column for column in ["site_id_lookup", "site_url_lookup"] if column in df.columns])
     return df
 
 
 @st.cache_data(show_spinner=False)
-def load_site_names() -> list[str]:
-    if not INVENTORY_PARQUET.exists():
+def load_site_names(inventory_parquet: str) -> list[str]:
+    parquet_path = Path(inventory_parquet)
+    if not parquet_path.exists():
         return []
 
     query = f"""
         SELECT DISTINCT site_name
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE site_name IS NOT NULL AND site_name <> ''
         ORDER BY site_name
     """
@@ -70,7 +229,8 @@ def site_filter_clause(selected_sites: list[str]) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def load_overview(selected_sites: tuple[str, ...]) -> dict[str, int]:
+def load_overview(selected_sites: tuple[str, ...], inventory_parquet: str) -> dict[str, int]:
+    parquet_path = Path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
@@ -79,7 +239,7 @@ def load_overview(selected_sites: tuple[str, ...]) -> dict[str, int]:
             COUNT_IF(tipo_item = 'file') AS files,
             COUNT_IF(tipo_item = 'folder') AS folders,
             COALESCE(SUM(CASE WHEN tipo_item = 'file' THEN tamanho_bytes ELSE 0 END), 0) AS total_bytes
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE 1=1
         {where_sites}
     """
@@ -87,7 +247,8 @@ def load_overview(selected_sites: tuple[str, ...]) -> dict[str, int]:
 
 
 @st.cache_data(show_spinner=False)
-def load_top_sites(selected_sites: tuple[str, ...]) -> pd.DataFrame:
+def load_top_sites(selected_sites: tuple[str, ...], inventory_parquet: str) -> pd.DataFrame:
+    parquet_path = Path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
@@ -95,7 +256,7 @@ def load_top_sites(selected_sites: tuple[str, ...]) -> pd.DataFrame:
             site_url,
             COUNT_IF(tipo_item = 'file') AS file_count,
             COALESCE(SUM(CASE WHEN tipo_item = 'file' THEN tamanho_bytes ELSE 0 END), 0) AS storage_bytes
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE 1=1
         {where_sites}
         GROUP BY site_name, site_url
@@ -108,14 +269,15 @@ def load_top_sites(selected_sites: tuple[str, ...]) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_top_extensions(selected_sites: tuple[str, ...]) -> pd.DataFrame:
+def load_top_extensions(selected_sites: tuple[str, ...], inventory_parquet: str) -> pd.DataFrame:
+    parquet_path = Path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
             COALESCE(NULLIF(extensao, ''), '(sem extensao)') AS extension,
             COUNT(*) AS file_count,
             COALESCE(SUM(tamanho_bytes), 0) AS storage_bytes
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE tipo_item = 'file'
         {where_sites}
         GROUP BY extension
@@ -128,7 +290,8 @@ def load_top_extensions(selected_sites: tuple[str, ...]) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_unused_files(selected_sites: tuple[str, ...], cutoff: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_unused_files(selected_sites: tuple[str, ...], cutoff: date, inventory_parquet: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    parquet_path = Path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     cutoff_text = cutoff.isoformat()
     base_where = f"""
@@ -143,7 +306,7 @@ def load_unused_files(selected_sites: tuple[str, ...], cutoff: date) -> tuple[pd
             site_url,
             COUNT(*) AS old_file_count,
             COALESCE(SUM(tamanho_bytes), 0) AS storage_bytes
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE {base_where}
         GROUP BY site_name, site_url
         ORDER BY storage_bytes DESC
@@ -158,7 +321,7 @@ def load_unused_files(selected_sites: tuple[str, ...], cutoff: date) -> tuple[pd
             tamanho_bytes,
             data_modificacao,
             caminho_item
-        FROM read_parquet('{INVENTORY_PARQUET.as_posix()}')
+        FROM read_parquet('{parquet_path.as_posix()}')
         WHERE {base_where}
         ORDER BY tamanho_bytes DESC
         LIMIT 100
@@ -181,24 +344,68 @@ def classify_activity(last_activity: pd.Timestamp | pd.NaT) -> str:
     return "Ativo"
 
 
-def main() -> None:
-    st.title("SharePoint Storage Dashboard")
-    st.caption("Analise de armazenamento, arquivos antigos, extensoes e sites inativos.")
+def classify_storage_limit(allocated_bytes: int | float | None) -> str:
+    if allocated_bytes is None or pd.isna(allocated_bytes) or float(allocated_bytes) <= 0:
+        return "Sem limite reportado"
+    if float(allocated_bytes) >= 25 * 1024**4:
+        return "Limite alto/padrao reportado"
+    return "Limite especifico aparente"
 
-    if not INVENTORY_PARQUET.exists():
-        st.error(f"Arquivo nao encontrado: {INVENTORY_PARQUET}")
+
+def prepare_storage_limits_table(priority: pd.DataFrame) -> pd.DataFrame:
+    table = priority.copy()
+    table["site_display_name"] = table.apply(
+        lambda row: display_site_name(row.get("site_name"), row.get("site_url")),
+        axis=1,
+    )
+    table["storage_used_gb"] = table["storage_used_bytes"] / BYTES_IN_GB
+    table["storage_allocated_gb"] = table["storage_allocated_bytes"] / BYTES_IN_GB
+    table["quota_usage_percent"] = (
+        table["storage_used_bytes"] / table["storage_allocated_bytes"].replace(0, pd.NA) * 100
+    ).fillna(0)
+    table["limit_status"] = table["storage_allocated_bytes"].apply(classify_storage_limit)
+    return table.sort_values(["limit_status", "storage_allocated_bytes", "storage_used_bytes"], ascending=[True, False, False])
+
+
+def main() -> None:
+    apply_styles()
+
+    workspaces = discover_client_workspaces()
+    workspace_by_name = {workspace.name: workspace for workspace in workspaces}
+    st.sidebar.header("Clientes")
+    selected_client_name = st.sidebar.selectbox(
+        "Base de dados",
+        options=list(workspace_by_name),
+        index=0,
+    )
+    workspace = workspace_by_name[selected_client_name]
+
+    with st.sidebar.expander("Arquivos da base"):
+        st.code(str(workspace.root_dir))
+
+    if not workspace.inventory_parquet.exists():
+        st.error(f"Arquivo nao encontrado: {workspace.inventory_parquet}")
         st.stop()
 
-    site_names = load_site_names()
-    selected_sites = st.sidebar.multiselect(
-        "Filtrar sites",
-        options=site_names,
-        placeholder="Todos os sites",
-    )
-    selected_sites_tuple = tuple(selected_sites)
-    cutoff = (pd.Timestamp.today().normalize() - pd.DateOffset(months=6)).date()
+    site_names = load_site_names(str(workspace.inventory_parquet))
+    header_left, header_right = st.columns((0.78, 0.22), vertical_alignment="top")
+    with header_left:
+        st.title("SharePoint Storage Dashboard")
+        st.caption("Analise de armazenamento, arquivos antigos, extensoes e sites inativos.")
 
-    overview = load_overview(selected_sites_tuple)
+    with header_right:
+        st.write("")
+        with st.popover("Filtros", icon=":material/filter_list:", use_container_width=True):
+            selected_sites = st.multiselect(
+                "Sites",
+                options=site_names,
+                placeholder="Todos os sites",
+            )
+
+    selected_sites_tuple = tuple(selected_sites)
+    cutoff = (pd.Timestamp.today().normalize() - pd.DateOffset(years=1)).date()
+
+    overview = load_overview(selected_sites_tuple, str(workspace.inventory_parquet))
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Armazenamento analisado", format_gb(overview["total_bytes"]))
     col2.metric("Sites", format_number(overview["sites"]))
@@ -208,18 +415,28 @@ def main() -> None:
     st.divider()
 
     left, right = st.columns((1.15, 0.85))
-    top_sites = load_top_sites(selected_sites_tuple)
+    top_sites = load_top_sites(selected_sites_tuple, str(workspace.inventory_parquet))
     with left:
-        st.subheader("Sites por armazenamento")
+        st.subheader("Top 10 sites por armazenamento")
+        top_sites_chart = prepare_site_chart_data(top_sites, "storage_gb")
         fig = px.bar(
-            top_sites.head(15).sort_values("storage_gb"),
+            top_sites_chart,
             x="storage_gb",
-            y="site_name",
+            y="site_label",
             orientation="h",
-            labels={"storage_gb": "GB", "site_name": "Site"},
+            labels={"storage_gb": "GB", "site_label": ""},
             text_auto=".1f",
+            custom_data=["site_name", "site_url", "file_count"],
         )
-        fig.update_layout(height=520, margin=dict(l=10, r=10, t=20, b=10))
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Armazenamento: %{x:.2f} GB<br>"
+                "Arquivos: %{customdata[2]:,}<br>"
+                "URL: %{customdata[1]}<extra></extra>"
+            )
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
@@ -234,47 +451,158 @@ def main() -> None:
 
     st.divider()
 
-    extensions = load_top_extensions(selected_sites_tuple)
-    col_ext_chart, col_ext_table = st.columns((1, 1))
-    with col_ext_chart:
-        st.subheader("Extensoes que mais ocupam espaco")
-        fig = px.treemap(
-            extensions,
-            path=["extension"],
-            values="storage_bytes",
-            color="file_count",
-            color_continuous_scale="Tealrose",
+    priority = load_site_priority(str(workspace.site_priority_csv), str(workspace.sqlite_db))
+    if not priority.empty:
+        storage_limits = prepare_storage_limits_table(priority)
+        st.subheader("Limites de armazenamento dos sites")
+        st.caption("Baseado no campo Storage Allocated do relatorio de uso do Microsoft 365.")
+        limit_col1, limit_col2, limit_col3 = st.columns(3)
+        limit_col1.metric("Sites com limite reportado", format_number((storage_limits["storage_allocated_bytes"] > 0).sum()))
+        limit_col2.metric("Sites sem limite reportado", format_number((storage_limits["storage_allocated_bytes"] <= 0).sum()))
+        limit_col3.metric(
+            "Sites com limite especifico aparente",
+            format_number((storage_limits["limit_status"] == "Limite especifico aparente").sum()),
         )
-        fig.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_ext_table:
-        st.subheader("Ranking por extensao")
         st.dataframe(
-            extensions.assign(storage_gb=extensions["storage_gb"].round(2))[
-                ["extension", "storage_gb", "file_count"]
-            ],
+            storage_limits[
+                [
+                    "site_display_name",
+                    "owner",
+                    "storage_used_gb",
+                    "storage_allocated_gb",
+                    "quota_usage_percent",
+                    "limit_status",
+                    "site_url",
+                ]
+            ].round(
+                {
+                    "storage_used_gb": 2,
+                    "storage_allocated_gb": 2,
+                    "quota_usage_percent": 2,
+                }
+            ),
+            column_config={
+                "site_display_name": "Site",
+                "owner": "Owner",
+                "storage_used_gb": "Usado GB",
+                "storage_allocated_gb": "Limite GB",
+                "quota_usage_percent": "% usado",
+                "limit_status": "Status do limite",
+                "site_url": "URL",
+            },
             hide_index=True,
             use_container_width=True,
         )
+        st.divider()
+    else:
+        st.info("Para exibir limites de armazenamento, gere o arquivo exports/site_priority.csv com: python main.py prioritize-sites --period D180")
+        st.divider()
+
+    extensions = load_top_extensions(selected_sites_tuple, str(workspace.inventory_parquet))
+    st.subheader("Analise por extensao")
+    ext_storage_chart, ext_count_chart = st.columns((1, 1))
+    with ext_storage_chart:
+        fig = px.bar(
+            extensions.sort_values("storage_gb", ascending=False).head(10).sort_values("storage_gb"),
+            x="storage_gb",
+            y="extension",
+            orientation="h",
+            labels={"storage_gb": "GB", "extension": ""},
+            text_auto=".1f",
+            custom_data=["file_count"],
+            title="Extensoes que mais ocupam espaco",
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Armazenamento: %{x:.2f} GB<br>"
+                "Arquivos: %{customdata[0]:,}<extra></extra>"
+            )
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=48, b=20), yaxis=dict(tickfont=dict(size=12)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with ext_count_chart:
+        fig = px.bar(
+            extensions.sort_values("file_count", ascending=False).head(10).sort_values("file_count"),
+            x="file_count",
+            y="extension",
+            orientation="h",
+            labels={"file_count": "Arquivos", "extension": ""},
+            text_auto=True,
+            custom_data=["storage_gb"],
+            title="Extensoes por quantidade de arquivos",
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Arquivos: %{x:,}<br>"
+                "Armazenamento: %{customdata[0]:.2f} GB<extra></extra>"
+            )
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=48, b=20), yaxis=dict(tickfont=dict(size=12)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Tabela por extensao")
+    extension_table = extensions.copy()
+    total_extension_bytes = extension_table["storage_bytes"].sum()
+    extension_table["storage_gb"] = extension_table["storage_gb"].round(2)
+    extension_table["avg_file_size_mb"] = (
+        extension_table["storage_bytes"] / extension_table["file_count"].replace(0, pd.NA) / 1024**2
+    ).fillna(0).round(2)
+    extension_table["storage_percent"] = (
+        extension_table["storage_bytes"] / total_extension_bytes * 100 if total_extension_bytes else 0
+    ).round(2)
+    st.dataframe(
+        extension_table[
+            ["extension", "storage_gb", "storage_percent", "file_count", "avg_file_size_mb"]
+        ],
+        column_config={
+            "extension": "Extensao",
+            "storage_gb": "GB",
+            "storage_percent": "% do total",
+            "file_count": "Arquivos",
+            "avg_file_size_mb": "Media MB/arquivo",
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
 
     st.divider()
 
-    unused_by_site, unused_sample = load_unused_files(selected_sites_tuple, cutoff)
+    unused_by_site, unused_sample = load_unused_files(selected_sites_tuple, cutoff, str(workspace.inventory_parquet))
     st.subheader("Arquivos em desuso")
-    st.caption(f"Criterio: arquivos sem modificacao desde antes de {cutoff.strftime('%d/%m/%Y')}.")
+    st.caption(f"Criterio: arquivos sem modificacao ha mais de 1 ano, desde antes de {cutoff.strftime('%d/%m/%Y')}.")
+
+    unused_total_bytes = unused_by_site["storage_bytes"].sum()
+    unused_total_files = unused_by_site["old_file_count"].sum()
+    unused_storage_percent = (unused_total_bytes / overview["total_bytes"] * 100) if overview["total_bytes"] else 0
+    unused_metric_col1, unused_metric_col2, unused_metric_col3 = st.columns(3)
+    unused_metric_col1.metric("Armazenamento em desuso", format_gb(unused_total_bytes))
+    unused_metric_col2.metric("Arquivos em desuso", format_number(unused_total_files))
+    unused_metric_col3.metric("% do armazenamento em desuso", f"{unused_storage_percent:.2f}%")
 
     old_col1, old_col2 = st.columns((1, 1))
     with old_col1:
+        unused_chart = prepare_site_chart_data(unused_by_site, "storage_gb")
         fig = px.bar(
-            unused_by_site.head(15).sort_values("storage_gb"),
+            unused_chart,
             x="storage_gb",
-            y="site_name",
+            y="site_label",
             orientation="h",
-            labels={"storage_gb": "GB", "site_name": "Site"},
+            labels={"storage_gb": "GB", "site_label": ""},
             text_auto=".1f",
+            custom_data=["site_name", "site_url", "old_file_count"],
         )
-        fig.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10))
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Arquivos antigos: %{customdata[2]:,}<br>"
+                "Armazenamento: %{x:.2f} GB<br>"
+                "URL: %{customdata[1]}<extra></extra>"
+            )
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
         st.plotly_chart(fig, use_container_width=True)
 
     with old_col2:
@@ -303,7 +631,6 @@ def main() -> None:
             use_container_width=True,
         )
 
-    priority = load_site_priority()
     if not priority.empty:
         st.divider()
         st.subheader("Sites inativos")
@@ -314,6 +641,7 @@ def main() -> None:
             inactive[
                 [
                     "rank",
+                    "site_name",
                     "owner",
                     "site_url",
                     "last_activity_date",

@@ -211,8 +211,30 @@ streamlit run dashboard/app.py
 
 O dashboard le `exports/inventory.parquet` e, quando existir, `exports/site_priority.csv`.
 Ele mostra ranking de sites por armazenamento, extensoes que mais ocupam espaco,
-arquivos sem modificacao ha mais de 6 meses e sites inativos pelo campo
+arquivos sem modificacao ha mais de 1 ano e sites inativos pelo campo
 `last_activity_date` do relatorio de uso do Microsoft 365.
+
+Para navegar entre clientes no dashboard, mantenha cada base em uma pasta dentro
+de `clients/` seguindo a mesma estrutura do projeto:
+
+```text
+clients/
+  Cliente A/
+    exports/
+      inventory.parquet
+      site_priority.csv
+    inventory/
+      sharepoint_inventory.sqlite3
+  Cliente B/
+    exports/
+      inventory.parquet
+      site_priority.csv
+    inventory/
+      sharepoint_inventory.sqlite3
+```
+
+O menu lateral do Streamlit inicia recolhido e pode ser usado como menu interno
+para selecionar a base do cliente. O filtro por site fica no topo do dashboard.
 
 ## Como o checkpoint funciona
 
@@ -371,7 +393,3 @@ para reprocessar falhas marcadas como retryable.
 - Execute exportacoes depois da coleta ou em janelas de baixa atividade.
 - Nao apague o SQLite entre `resume` ou `resume-delta`.
 - Para sites gigantes, rode primeiro `prioritize-sites` e use os arquivos `site_ids_*` com `crawl-delta`.
-
-
-## Melhorias futuras
-- Criar um de/para para fazer o mapeamento dos sites fazendo a relação entre o site id e o site url para não precisar mexer tanto na tenant
