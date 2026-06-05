@@ -201,6 +201,19 @@ Se o notebook nao reconhecer `duckdb`, execute a celula de instalacao nele ou in
 python -m pip install duckdb pandas pyarrow jupyter
 ```
 
+Executar dashboard Streamlit:
+
+```bash
+python main.py prioritize-sites --period D180
+python main.py export --format parquet
+streamlit run dashboard/app.py
+```
+
+O dashboard le `exports/inventory.parquet` e, quando existir, `exports/site_priority.csv`.
+Ele mostra ranking de sites por armazenamento, extensoes que mais ocupam espaco,
+arquivos sem modificacao ha mais de 6 meses e sites inativos pelo campo
+`last_activity_date` do relatorio de uso do Microsoft 365.
+
 ## Como o checkpoint funciona
 
 O SQLite guarda tudo que ja foi descoberto e lido:
