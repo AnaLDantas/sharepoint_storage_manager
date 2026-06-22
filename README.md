@@ -134,6 +134,15 @@ Para usar delta com uma lista limitada de sites:
 python main.py crawl-delta
 ```
 
+Para refazer do zero um site especifico, informe somente esse site em `SITE_IDS`
+e use `--full-resync`. Esse modo limpa o checkpoint delta e os itens ja
+catalogados daquele site antes de reenumerar as bibliotecas:
+
+```bash
+SITE_IDS=d0f8a32b-aa1c-4737-b54b-534aec98e889 python main.py crawl-delta --full-resync
+python main.py export --format parquet
+```
+
 Tambem e possivel informar IDs diretamente no `.env`:
 
 ```env

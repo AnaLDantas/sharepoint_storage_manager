@@ -460,6 +460,28 @@ class InventoryDatabase:
                     [now, *state_params],
                 )
 
+    def reset_delta_sync(self, site_ids: set[str] | None = None, clear_items: bool = False) -> None:
+        with self.transaction() as conn:
+            now = utc_now()
+            state_filter, state_params = self._site_filter(site_ids)
+            conn.execute(
+                f"""
+                UPDATE drive_sync_state
+                SET status='pending',
+                    next_link=NULL,
+                    delta_link=NULL,
+                    last_error=NULL,
+                    updated_at=?
+                WHERE 1=1
+                {state_filter}
+                """,
+                [now, *state_params],
+            )
+            if clear_items:
+                item_filter, item_params = self._site_filter(site_ids)
+                conn.execute(f"DELETE FROM folders_queue WHERE 1=1 {item_filter}", item_params)
+                conn.execute(f"DELETE FROM items WHERE 1=1 {item_filter}", item_params)
+
     def claim_delta_drive(self, site_ids: set[str] | None = None) -> sqlite3.Row | None:
         with self.transaction() as conn:
             state_filter, state_params = self._site_filter(site_ids)

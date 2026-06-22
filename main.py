@@ -27,7 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("crawl", help="Executa descoberta de sites/drives e processa fila completa")
     sub.add_parser("resume", help="Continua uma coleta interrompida usando checkpoint SQLite")
-    sub.add_parser("crawl-delta", help="Executa descoberta e sincroniza drives via delta com checkpoint por pagina")
+    crawl_delta_parser = sub.add_parser("crawl-delta", help="Executa descoberta e sincroniza drives via delta com checkpoint por pagina")
+    crawl_delta_parser.add_argument(
+        "--full-resync",
+        action="store_true",
+        help="Limpa checkpoint e itens dos sites filtrados antes de reenumerar tudo",
+    )
     sub.add_parser("resume-delta", help="Continua sincronizacao delta usando nextLink/deltaLink salvos")
     sub.add_parser("retry-errors", help="Reprocessa erros retryable e volta a consumir a fila")
     export = sub.add_parser("export", help="Exporta inventario e relatorios")
@@ -99,7 +104,7 @@ def crawl(command: str) -> int:
         LOGGER.info("Estatisticas finais: %s", stats)
 
 
-def crawl_delta(command: str) -> int:
+def crawl_delta(command: str, full_resync: bool = False) -> int:
     from crawler import InventoryCrawler, install_signal_handlers
     from database import InventoryDatabase
     from graph_client import GraphClient
@@ -128,6 +133,13 @@ def crawl_delta(command: str) -> int:
                 user_site_ids = crawler.discover_user_onedrives(enqueue_roots=False)
                 if discovered_site_ids is not None:
                     discovered_site_ids.extend(user_site_ids)
+            if full_resync:
+                target_site_ids = set(discovered_site_ids) if discovered_site_ids is not None else None
+                if target_site_ids is None:
+                    LOGGER.warning("Full resync sem SITE_IDS/SITE_IDS_FILE: todos os sites descobertos serao reenumerados.")
+                else:
+                    LOGGER.info("Full resync solicitado para %s Site IDs", len(target_site_ids))
+                db.reset_delta_sync(site_ids=target_site_ids, clear_items=True)
             crawler.process_delta_drives(
                 reset_completed=True,
                 site_ids=set(discovered_site_ids) if discovered_site_ids is not None else None,
@@ -235,7 +247,7 @@ def main() -> int:
     if args.command in {"crawl", "resume"}:
         return crawl(args.command)
     if args.command in {"crawl-delta", "resume-delta"}:
-        return crawl_delta(args.command)
+        return crawl_delta(args.command, getattr(args, "full_resync", False))
     if args.command == "retry-errors":
         return retry_errors()
     if args.command == "export":
