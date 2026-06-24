@@ -181,21 +181,19 @@ class GraphClient:
             next_params = None
 
     def list_sites(self, search_query: str = "*") -> Iterator[dict[str, Any]]:
+        if search_query.strip() == "*":
+            yield from self.list_all_sites()
+            return
         yield from self.paged_get("/sites", params={"search": search_query})
+
+    def list_all_sites(self) -> Iterator[dict[str, Any]]:
+        yield from self.paged_get("/sites/getAllSites")
 
     def get_site(self, site_id: str) -> dict[str, Any]:
         return self.get(f"/sites/{quote(site_id, safe='')}")
 
     def list_site_drives(self, site_id: str) -> Iterator[dict[str, Any]]:
         yield from self.paged_get(f"/sites/{quote(site_id, safe='')}/drives")
-
-    def get_drive_root(self, drive_id: str) -> dict[str, Any]:
-        return self.get(f"/drives/{quote(drive_id, safe='')}/root")
-
-    def list_children(self, drive_id: str, item_id: str) -> Iterator[dict[str, Any]]:
-        select = "id,name,size,folder,file,package,parentReference,createdDateTime,lastModifiedDateTime,lastAccessedDateTime,webUrl"
-        path = f"/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}/children"
-        yield from self.paged_get(path, params={"$select": select, "$top": 999})
 
     def drive_delta_page(self, drive_id: str, next_url: str | None = None, delta_url: str | None = None) -> dict[str, Any]:
         select = "id,name,size,folder,file,package,root,parentReference,createdDateTime,lastModifiedDateTime,lastAccessedDateTime,webUrl,deleted"

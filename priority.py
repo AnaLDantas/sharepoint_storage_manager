@@ -163,14 +163,6 @@ def _write_priority_csv(sites: list[SitePriority], output_file: Path) -> None:
             writer.writerow(site.as_row())
 
 
-def _write_urls(sites: list[SitePriority], output_file: Path) -> None:
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with output_file.open("w", encoding="utf-8") as handle:
-        for site in sites:
-            if site.site_url:
-                handle.write(f"{site.site_url}\n")
-
-
 def _write_ids(sites: list[SitePriority], output_file: Path) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w", encoding="utf-8") as handle:
@@ -287,11 +279,6 @@ def generate_site_priority(
     }
 
     _write_priority_csv(sites, output_dir / "site_priority.csv")
-    _write_urls(sites, output_dir / "sites_priority_order.txt")
-    _write_urls(over_1tb, output_dir / "sites_over_1tb.txt")
-    _write_urls(over_500gb, output_dir / "sites_500gb_to_1tb.txt")
-    _write_urls(over_100gb, output_dir / "sites_100gb_to_500gb.txt")
-    _write_urls(under_100gb, output_dir / "sites_under_100gb.txt")
     _write_ids(sites, output_dir / "site_ids_priority_order.txt")
     _write_ids(over_1tb, output_dir / "site_ids_over_1tb.txt")
     _write_ids(over_500gb, output_dir / "site_ids_500gb_to_1tb.txt")

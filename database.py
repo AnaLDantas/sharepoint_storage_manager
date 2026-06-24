@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from models import DriveRecord, ItemRecord, QueueFolder, SiteRecord
+from models import DriveRecord, ItemRecord, SiteRecord
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,15 +30,7 @@ def format_size(size: int | None) -> str:
 
 
 class InventoryDatabase:
-    """SQLite local usado como catalogo e checkpoint.
-
-    Checkpoint/restart:
-    - Cada pasta a ler entra em folders_queue como pending.
-    - Um worker muda a pasta para in_progress dentro de uma transacao.
-    - A pasta so vira done depois que todos os filhos da pagina Graph foram gravados.
-    - Se o processo cair, pastas in_progress voltam para pending no proximo resume.
-      Como items usa chave unica por drive/item, reler a mesma pasta apenas atualiza registros.
-    """
+    """SQLite local usado como catalogo e checkpoint delta."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -125,22 +117,6 @@ class InventoryDatabase:
                     FOREIGN KEY(drive_id) REFERENCES drives(id)
                 );
 
-                CREATE TABLE IF NOT EXISTS folders_queue (
-                    drive_id TEXT NOT NULL,
-                    item_id TEXT NOT NULL,
-                    site_id TEXT NOT NULL,
-                    library_name TEXT,
-                    path TEXT NOT NULL,
-                    name TEXT,
-                    depth INTEGER DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (drive_id, item_id)
-                );
-
                 CREATE TABLE IF NOT EXISTS drive_sync_state (
                     drive_id TEXT PRIMARY KEY,
                     site_id TEXT NOT NULL,
@@ -180,7 +156,6 @@ class InventoryDatabase:
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_queue_status ON folders_queue(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_drive_sync_status ON drive_sync_state(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(drive_id, parent_id);
                 CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type);
@@ -202,17 +177,6 @@ class InventoryDatabase:
             conn.execute(
                 "UPDATE runs SET finished_at=?, status=?, stats_json=? WHERE id=?",
                 (utc_now(), status, json.dumps(stats, ensure_ascii=False), run_id),
-            )
-
-    def reset_interrupted_work(self) -> None:
-        with self.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE folders_queue
-                SET status='pending', updated_at=?, last_error=COALESCE(last_error, 'Retomado apos interrupcao')
-                WHERE status='in_progress'
-                """,
-                (utc_now(),),
             )
 
     def upsert_site(self, site: SiteRecord) -> None:
@@ -254,81 +218,6 @@ class InventoryDatabase:
                     updated_at=excluded.updated_at
                 """,
                 (drive.id, drive.site_id, drive.name, utc_now(), utc_now()),
-            )
-
-    def mark_drive_processed(self, drive_id: str) -> None:
-        with self.transaction() as conn:
-            conn.execute("UPDATE drives SET processed_at=? WHERE id=?", (utc_now(), drive_id))
-
-    def enqueue_folder(self, folder: QueueFolder) -> None:
-        self.enqueue_folders_batch([folder])
-
-    def enqueue_folders_batch(self, folders: list[QueueFolder]) -> None:
-        if not folders:
-            return
-        with self.transaction() as conn:
-            now = utc_now()
-            conn.executemany(
-                """
-                INSERT INTO folders_queue(drive_id, item_id, site_id, library_name, path, name, depth, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                ON CONFLICT(drive_id, item_id) DO UPDATE SET
-                    site_id=excluded.site_id,
-                    library_name=excluded.library_name,
-                    path=excluded.path,
-                    name=excluded.name,
-                    depth=excluded.depth,
-                    updated_at=excluded.updated_at
-                """,
-                [
-                    (folder.drive_id, folder.item_id, folder.site_id, folder.library_name, folder.path, folder.name, folder.depth, now, now)
-                    for folder in folders
-                ],
-            )
-
-    def claim_folder(self) -> QueueFolder | None:
-        with self.transaction() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM folders_queue
-                WHERE status='pending'
-                ORDER BY depth ASC, updated_at ASC
-                LIMIT 1
-                """
-            ).fetchone()
-            if not row:
-                return None
-            conn.execute(
-                """
-                UPDATE folders_queue
-                SET status='in_progress', attempts=attempts+1, updated_at=?
-                WHERE drive_id=? AND item_id=? AND status='pending'
-                """,
-                (utc_now(), row["drive_id"], row["item_id"]),
-            )
-            return QueueFolder(
-                drive_id=row["drive_id"],
-                item_id=row["item_id"],
-                site_id=row["site_id"],
-                library_name=row["library_name"],
-                path=row["path"],
-                name=row["name"],
-                depth=row["depth"],
-            )
-
-    def complete_folder(self, drive_id: str, item_id: str) -> None:
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE folders_queue SET status='done', updated_at=?, last_error=NULL WHERE drive_id=? AND item_id=?",
-                (utc_now(), drive_id, item_id),
-            )
-
-    def fail_folder(self, drive_id: str, item_id: str, message: str, retryable: bool = True) -> None:
-        status = "pending" if retryable else "failed"
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE folders_queue SET status=?, updated_at=?, last_error=? WHERE drive_id=? AND item_id=?",
-                (status, utc_now(), message[:2000], drive_id, item_id),
             )
 
     def upsert_item(self, item: ItemRecord, status: str = "ok") -> None:
@@ -600,6 +489,47 @@ class InventoryDatabase:
                 (utc_now(), message[:2000], drive_id),
             )
 
+    def reset_site_inventory(self, site_id: str) -> dict[str, int]:
+        """Remove dados/checkpoints de um site para permitir nova coleta completa."""
+        site_id = site_id.strip()
+        if not site_id:
+            raise ValueError("site_id nao pode ser vazio")
+
+        with self.transaction() as conn:
+            drive_rows = conn.execute("SELECT id FROM drives WHERE site_id=?", (site_id,)).fetchall()
+            drive_ids = [row["id"] for row in drive_rows]
+            now = utc_now()
+
+            counts = {
+                "sites": int(conn.execute("SELECT COUNT(*) FROM sites WHERE id=?", (site_id,)).fetchone()[0]),
+                "drives": len(drive_ids),
+                "items": int(conn.execute("SELECT COUNT(*) FROM items WHERE site_id=?", (site_id,)).fetchone()[0]),
+                "drive_sync_state": int(conn.execute("SELECT COUNT(*) FROM drive_sync_state WHERE site_id=?", (site_id,)).fetchone()[0]),
+                "errors": int(conn.execute("SELECT COUNT(*) FROM errors WHERE site_id=?", (site_id,)).fetchone()[0]),
+            }
+
+            conn.execute("DELETE FROM items WHERE site_id=?", (site_id,))
+            conn.execute("DELETE FROM errors WHERE site_id=?", (site_id,))
+            conn.execute(
+                """
+                UPDATE drive_sync_state
+                SET status='pending',
+                    attempts=0,
+                    next_link=NULL,
+                    delta_link=NULL,
+                    last_error=NULL,
+                    updated_at=?,
+                    last_started_at=NULL,
+                    last_completed_at=NULL
+                WHERE site_id=?
+                """,
+                (now, site_id),
+            )
+            conn.execute("UPDATE drives SET processed_at=NULL WHERE site_id=?", (site_id,))
+            conn.execute("UPDATE sites SET processed_at=NULL WHERE id=?", (site_id,))
+
+            return counts
+
     def delta_pending_count(self, site_ids: set[str] | None = None) -> int:
         with self._lock:
             state_filter, state_params = self._site_filter(site_ids)
@@ -629,35 +559,38 @@ class InventoryDatabase:
             ).fetchone()
             return row["full_path"] if row and row["full_path"] else fallback
 
-    def pending_count(self) -> int:
+    def stats(self, include_inventory_totals: bool = True) -> dict[str, Any]:
         with self._lock:
-            return int(self.conn.execute("SELECT COUNT(*) FROM folders_queue WHERE status='pending'").fetchone()[0])
-
-    def queue_counts(self) -> dict[str, int]:
-        with self._lock:
-            rows = self.conn.execute("SELECT status, COUNT(*) total FROM folders_queue GROUP BY status").fetchall()
-            return {row["status"]: row["total"] for row in rows}
-
-    def stats(self) -> dict[str, Any]:
-        with self._lock:
-            row = self.conn.execute(
-                """
-                SELECT
-                    (SELECT COUNT(*) FROM sites) sites,
-                    (SELECT COUNT(*) FROM drives) drives,
-                    (SELECT COUNT(*) FROM items WHERE item_type='folder' AND status!='deleted') folders,
-                    (SELECT COUNT(*) FROM items WHERE item_type='file' AND status!='deleted') files,
-                    (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE item_type='file' AND status!='deleted') total_bytes,
-                    (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors,
-                    (SELECT MAX(updated_at) FROM folders_queue) last_queue_checkpoint,
-                    (SELECT MAX(updated_at) FROM drive_sync_state) last_delta_checkpoint
-                """
-            ).fetchone()
+            if include_inventory_totals:
+                row = self.conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM sites) sites,
+                        (SELECT COUNT(*) FROM drives) drives,
+                        (SELECT COUNT(*) FROM items WHERE item_type='folder' AND status!='deleted') folders,
+                        (SELECT COUNT(*) FROM items WHERE item_type='file' AND status!='deleted') files,
+                        (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE item_type='file' AND status!='deleted') total_bytes,
+                        (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors,
+                        (SELECT MAX(updated_at) FROM drive_sync_state) last_delta_checkpoint
+                    """
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM sites) sites,
+                        (SELECT COUNT(*) FROM drives) drives,
+                        0 folders,
+                        0 files,
+                        0 total_bytes,
+                        (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors,
+                        (SELECT MAX(updated_at) FROM drive_sync_state) last_delta_checkpoint
+                    """
+                ).fetchone()
             data = dict(row)
             data["total_formatted"] = format_size(data["total_bytes"])
-            data["queue"] = self.queue_counts()
             data["delta"] = self.delta_counts()
-            data["last_checkpoint"] = data.get("last_delta_checkpoint") or data.get("last_queue_checkpoint")
+            data["last_checkpoint"] = data.get("last_delta_checkpoint")
             return data
 
     def recalculate_folder_aggregates(self) -> None:
@@ -697,12 +630,3 @@ class InventoryDatabase:
                     (row["file_count"], row["total_size"], format_size(row["total_size"]), folder["drive_id"], folder["id"]),
                 )
 
-    def unresolved_retryable_errors(self) -> list[sqlite3.Row]:
-        with self._lock:
-            return self.conn.execute(
-                "SELECT * FROM errors WHERE resolved=0 AND retryable=1 ORDER BY created_at ASC"
-            ).fetchall()
-
-    def mark_error_resolved(self, error_id: int) -> None:
-        with self.transaction() as conn:
-            conn.execute("UPDATE errors SET resolved=1, updated_at=? WHERE id=?", (utc_now(), error_id))

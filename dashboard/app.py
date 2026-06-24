@@ -32,15 +32,24 @@ class ClientWorkspace:
     name: str
     root_dir: Path
     inventory_parquet: Path
+    gold_dir: Path
     site_priority_csv: Path
     sqlite_db: Path
 
 
 def workspace_from_root(name: str, root_dir: Path) -> ClientWorkspace:
+    exports_dir = root_dir / "exports"
+    parquet_datasets = sorted(
+        (path for path in exports_dir.glob("inventory_parquet*") if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    parquet_dataset = parquet_datasets[0] if parquet_datasets else exports_dir / "inventory_parquet"
     return ClientWorkspace(
         name=name,
         root_dir=root_dir,
-        inventory_parquet=root_dir / "exports" / "inventory.parquet",
+        inventory_parquet=parquet_dataset,
+        gold_dir=root_dir / "data" / "gold",
         site_priority_csv=root_dir / "exports" / "site_priority.csv",
         sqlite_db=root_dir / "inventory" / "sharepoint_inventory.sqlite3",
     )
@@ -53,6 +62,7 @@ def discover_client_workspaces() -> list[ClientWorkspace]:
             workspace = workspace_from_root(client_dir.name, client_dir)
             has_data = (
                 workspace.inventory_parquet.exists()
+                or (workspace.gold_dir / "storage_kpis.parquet").exists()
                 or workspace.site_priority_csv.exists()
                 or workspace.sqlite_db.exists()
             )
@@ -129,6 +139,71 @@ def display_site_name(site_name: str | None, site_url: str | None = None) -> str
         path_name = parsed.path.rstrip("/").split("/")[-1]
         return path_name or parsed.netloc or name or "(sem nome)"
     return name or "(sem nome)"
+
+
+def parquet_scan_path(inventory_parquet: str) -> str:
+    parquet_path = Path(inventory_parquet)
+    return (parquet_path / "*.parquet").as_posix()
+
+
+@st.cache_data(show_spinner=False)
+def load_gold_table(gold_dir: str, table_name: str) -> pd.DataFrame:
+    path = Path(gold_dir) / f"{table_name}.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def render_gold_dashboard(workspace: ClientWorkspace) -> None:
+    st.title("SharePoint Storage Dashboard")
+    st.caption("Camada Gold Lakehouse")
+
+    storage_kpis = load_gold_table(str(workspace.gold_dir), "storage_kpis")
+    top_sites = load_gold_table(str(workspace.gold_dir), "top_sites")
+    top_extensions = load_gold_table(str(workspace.gold_dir), "top_extensions")
+    savings = load_gold_table(str(workspace.gold_dir), "storage_savings")
+
+    if storage_kpis.empty:
+        st.error(f"Camada Gold nao encontrada em: {workspace.gold_dir}")
+        st.stop()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Armazenamento analisado", f"{storage_kpis['storage_gb'].sum():,.2f} GB")
+    col2.metric("Sites", format_number(storage_kpis["site_name"].nunique()))
+    col3.metric("Arquivos", format_number(storage_kpis["total_files"].sum()))
+    col4.metric("Potencial de arquivo", f"{storage_kpis['archive_candidate_gb'].sum():,.2f} GB")
+
+    st.divider()
+
+    left, right = st.columns((1.15, 0.85))
+    with left:
+        st.subheader("Top sites por armazenamento")
+        fig = px.bar(
+            top_sites.head(10).sort_values("storage_gb"),
+            x="storage_gb",
+            y="site_name",
+            orientation="h",
+            labels={"storage_gb": "GB", "site_name": ""},
+            text_auto=".1f",
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        st.subheader("Economia estimada")
+        st.dataframe(
+            savings.head(25).round({"current_storage_gb": 2, "archive_candidate_gb": 2, "estimated_saving_pct": 2}),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("Top extensoes")
+    st.dataframe(
+        top_extensions.head(50).round({"storage_gb": 2}),
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 def prepare_site_chart_data(df: pd.DataFrame, value_column: str, limit: int = TOP_SITE_CHART_LIMIT) -> pd.DataFrame:
@@ -211,10 +286,11 @@ def load_site_names(inventory_parquet: str) -> list[str]:
     parquet_path = Path(inventory_parquet)
     if not parquet_path.exists():
         return []
+    parquet_scan = parquet_scan_path(inventory_parquet)
 
     query = f"""
         SELECT DISTINCT site_name
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE site_name IS NOT NULL AND site_name <> ''
         ORDER BY site_name
     """
@@ -230,7 +306,7 @@ def site_filter_clause(selected_sites: list[str]) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_overview(selected_sites: tuple[str, ...], inventory_parquet: str) -> dict[str, int]:
-    parquet_path = Path(inventory_parquet)
+    parquet_scan = parquet_scan_path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
@@ -239,7 +315,7 @@ def load_overview(selected_sites: tuple[str, ...], inventory_parquet: str) -> di
             COUNT_IF(tipo_item = 'file') AS files,
             COUNT_IF(tipo_item = 'folder') AS folders,
             COALESCE(SUM(CASE WHEN tipo_item = 'file' THEN tamanho_bytes ELSE 0 END), 0) AS total_bytes
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE 1=1
         {where_sites}
     """
@@ -248,7 +324,7 @@ def load_overview(selected_sites: tuple[str, ...], inventory_parquet: str) -> di
 
 @st.cache_data(show_spinner=False)
 def load_top_sites(selected_sites: tuple[str, ...], inventory_parquet: str) -> pd.DataFrame:
-    parquet_path = Path(inventory_parquet)
+    parquet_scan = parquet_scan_path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
@@ -256,7 +332,7 @@ def load_top_sites(selected_sites: tuple[str, ...], inventory_parquet: str) -> p
             site_url,
             COUNT_IF(tipo_item = 'file') AS file_count,
             COALESCE(SUM(CASE WHEN tipo_item = 'file' THEN tamanho_bytes ELSE 0 END), 0) AS storage_bytes
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE 1=1
         {where_sites}
         GROUP BY site_name, site_url
@@ -270,14 +346,14 @@ def load_top_sites(selected_sites: tuple[str, ...], inventory_parquet: str) -> p
 
 @st.cache_data(show_spinner=False)
 def load_top_extensions(selected_sites: tuple[str, ...], inventory_parquet: str) -> pd.DataFrame:
-    parquet_path = Path(inventory_parquet)
+    parquet_scan = parquet_scan_path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     query = f"""
         SELECT
             COALESCE(NULLIF(extensao, ''), '(sem extensao)') AS extension,
             COUNT(*) AS file_count,
             COALESCE(SUM(tamanho_bytes), 0) AS storage_bytes
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE tipo_item = 'file'
         {where_sites}
         GROUP BY extension
@@ -291,7 +367,7 @@ def load_top_extensions(selected_sites: tuple[str, ...], inventory_parquet: str)
 
 @st.cache_data(show_spinner=False)
 def load_unused_files(selected_sites: tuple[str, ...], cutoff: date, inventory_parquet: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    parquet_path = Path(inventory_parquet)
+    parquet_scan = parquet_scan_path(inventory_parquet)
     where_sites = site_filter_clause(list(selected_sites))
     cutoff_text = cutoff.isoformat()
     base_where = f"""
@@ -306,7 +382,7 @@ def load_unused_files(selected_sites: tuple[str, ...], cutoff: date, inventory_p
             site_url,
             COUNT(*) AS old_file_count,
             COALESCE(SUM(tamanho_bytes), 0) AS storage_bytes
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE {base_where}
         GROUP BY site_name, site_url
         ORDER BY storage_bytes DESC
@@ -321,7 +397,7 @@ def load_unused_files(selected_sites: tuple[str, ...], cutoff: date, inventory_p
             tamanho_bytes,
             data_modificacao,
             caminho_item
-        FROM read_parquet('{parquet_path.as_posix()}')
+        FROM read_parquet('{parquet_scan}')
         WHERE {base_where}
         ORDER BY tamanho_bytes DESC
         LIMIT 100
@@ -384,6 +460,9 @@ def main() -> None:
         st.code(str(workspace.root_dir))
 
     if not workspace.inventory_parquet.exists():
+        if (workspace.gold_dir / "storage_kpis.parquet").exists():
+            render_gold_dashboard(workspace)
+            return
         st.error(f"Arquivo nao encontrado: {workspace.inventory_parquet}")
         st.stop()
 

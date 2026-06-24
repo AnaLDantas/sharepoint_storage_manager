@@ -24,17 +24,6 @@ class DriveRecord:
 
 
 @dataclass(frozen=True)
-class QueueFolder:
-    drive_id: str
-    item_id: str
-    site_id: str
-    library_name: str
-    path: str
-    name: str
-    depth: int
-
-
-@dataclass(frozen=True)
 class ItemRecord:
     id: str
     drive_id: str
