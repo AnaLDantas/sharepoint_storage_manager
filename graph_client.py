@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from typing import Any, Iterator
 from urllib.parse import quote
@@ -36,15 +37,63 @@ class GraphClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.session = requests.Session()
+        # Trafego decorado (User-Agent no formato NONISV|Empresa|App/Versao) e
+        # priorizado pelo SharePoint Online e reduz a frequencia de 429/503.
+        self.session.headers["User-Agent"] = settings.user_agent
         self._token: str | None = None
         self._token_expires_at = 0.0
         self.retry_count = 0
         self.throttle_count = 0
+        # Portao de pacing compartilhado entre threads: quando um worker leva 429
+        # ou ve poucas unidades restantes nos headers RateLimit, todos recuam juntos.
+        self._pace_lock = threading.Lock()
+        self._pause_until = 0.0
         self._app = msal.ConfidentialClientApplication(
             client_id=settings.client_id,
             client_credential=settings.client_secret,
             authority=settings.authority,
         )
+
+    def _wait_for_gate(self) -> None:
+        """Bloqueia ate o fim de uma pausa global de throttling, se houver."""
+        while True:
+            with self._pace_lock:
+                wait = self._pause_until - time.monotonic()
+            if wait <= 0:
+                return
+            time.sleep(min(wait, 5.0))
+
+    def _set_pause(self, seconds: float) -> None:
+        """Estende a pausa global. Todos os workers respeitam o maior valor."""
+        if seconds <= 0:
+            return
+        with self._pace_lock:
+            target = time.monotonic() + seconds
+            if target > self._pause_until:
+                self._pause_until = target
+
+    def _observe_rate_limit(self, response: requests.Response) -> None:
+        """Pacing proativo: recua antes do 429 quando restam poucas unidades.
+
+        O SharePoint/Graph retorna RateLimit-Remaining e RateLimit-Reset. Quando
+        o remaining fica abaixo do limiar configurado, pausamos por uma fracao da
+        janela de reset para nao estourar o limite.
+        """
+        remaining = response.headers.get("RateLimit-Remaining")
+        if remaining is None:
+            return
+        try:
+            remaining_val = float(remaining)
+        except ValueError:
+            return
+        if remaining_val > self.settings.rate_limit_min_remaining:
+            return
+        try:
+            reset_val = float(response.headers.get("RateLimit-Reset", "1"))
+        except ValueError:
+            reset_val = 1.0
+        self._set_pause(min(reset_val, 20.0))
+        LOGGER.info("RateLimit baixo (restante=%s). Pausando ~%.1fs proativamente.", remaining_val, min(reset_val, 20.0))
 
     def _access_token(self) -> str:
         if self._token and time.time() < self._token_expires_at - 300:
@@ -60,6 +109,7 @@ class GraphClient:
         url = url_or_path if url_or_path.startswith("http") else f"{self.settings.graph_base_url}{url_or_path}"
         attempt = 0
         while True:
+            self._wait_for_gate()
             token = self._access_token()
             try:
                 response = self.session.get(
@@ -81,6 +131,7 @@ class GraphClient:
                 message = response.text[:1000]
 
             if response is not None and 200 <= response.status_code < 300:
+                self._observe_rate_limit(response)
                 if not response.content:
                     return {}
                 return response.json()
@@ -95,6 +146,8 @@ class GraphClient:
                     self.throttle_count += 1
                 retry_after = response.headers.get("Retry-After") if response is not None else None
                 delay = self._retry_delay(attempt, retry_after)
+                # Faz os demais workers recuarem junto, nao apenas este.
+                self._set_pause(delay)
                 LOGGER.warning("Graph %s em %s. Retry em %.1fs", status_code, url, delay)
                 time.sleep(delay)
                 continue
