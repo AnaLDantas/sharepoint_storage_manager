@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 
-from config import configure_logging, load_settings
+from config import _bool, configure_logging, load_settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ def crawl(command: str) -> int:
     status = "success"
     try:
         if command == "crawl":
+            full_resync = _bool(os.environ.get("FULL_RESYNC"), False)
             site_ids = list(settings.site_ids) + _load_lines(settings.site_ids_file)
             discovered_site_ids: list[str] | None = None
             if site_ids:
@@ -96,7 +98,9 @@ def crawl(command: str) -> int:
             )
         else:
             crawler.process_delta_drives(reset_completed=False)
-        db.recalculate_folder_aggregates()
+        # Agregados de pastas nao rodam mais ao fim de todo crawl: sao caros
+        # (uma transacao por pasta) e nao sao usados pelo dashboard. Rode quando
+        # precisar via: python main.py export --recalculate-folders
         return 0
     except Exception:
         status = "failed"
@@ -164,6 +168,7 @@ def export(parquet_rows_per_file: int = 1_000_000, recalculate_folders: bool = F
     configure_logging(settings.log_level)
     db = InventoryDatabase(settings.sqlite_db_path)
     db.init_schema()
+    db.create_analytics_indexes()
     if recalculate_folders:
         LOGGER.info("Recalculando agregados de pastas antes da exportacao")
         db.recalculate_folder_aggregates()
@@ -201,6 +206,7 @@ def summary(recalculate_folders: bool = False) -> int:
     configure_logging(settings.log_level)
     db = InventoryDatabase(settings.sqlite_db_path)
     db.init_schema()
+    db.create_analytics_indexes()
     if recalculate_folders:
         db.recalculate_folder_aggregates()
     stats = print_summary(settings.sqlite_db_path)
