@@ -41,6 +41,12 @@ class InventoryDatabase:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        # Tuning de ingestao para runs longos com milhoes de linhas.
+        self.conn.execute("PRAGMA cache_size=-262144")   # ~256 MB de page cache
+        self.conn.execute("PRAGMA mmap_size=268435456")  # 256 MB mapeados em memoria
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA busy_timeout=60000")
+        self.conn.execute("PRAGMA wal_autocheckpoint=2000")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -157,12 +163,36 @@ class InventoryDatabase:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_drive_sync_status ON drive_sync_state(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_errors_retry ON errors(resolved, retryable);
+                -- Indice parcial minusculo: serve drive_root_path() sem varrer items inteira.
+                CREATE INDEX IF NOT EXISTS idx_items_drive_root
+                    ON items(drive_id)
+                    WHERE parent_id IS NULL AND item_type='folder';
+                """
+            )
+
+    def create_analytics_indexes(self) -> None:
+        """Cria os indices pesados de items usados por export/summary/agregados.
+
+        Sao criados sob demanda (depois do crawl) para nao pagar manutencao de
+        indice a cada insert durante a coleta, que e o gargalo de escrita.
+        """
+        with self.transaction() as conn:
+            conn.executescript(
+                """
                 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(drive_id, parent_id);
                 CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type);
                 CREATE INDEX IF NOT EXISTS idx_items_site_drive ON items(site_id, drive_id);
-                CREATE INDEX IF NOT EXISTS idx_errors_retry ON errors(resolved, retryable);
                 """
             )
+
+    def wal_checkpoint(self) -> None:
+        """Trunca o WAL para evitar que o arquivo cresca indefinidamente no run."""
+        with self._lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError as exc:
+                LOGGER.debug("wal_checkpoint ignorado: %s", exc)
 
     def start_run(self, command: str) -> int:
         with self.transaction() as conn:
@@ -368,7 +398,7 @@ class InventoryDatabase:
             )
             if clear_items:
                 item_filter, item_params = self._site_filter(site_ids)
-                conn.execute(f"DELETE FROM folders_queue WHERE 1=1 {item_filter}", item_params)
+
                 conn.execute(f"DELETE FROM items WHERE 1=1 {item_filter}", item_params)
 
     def claim_delta_drive(self, site_ids: set[str] | None = None) -> sqlite3.Row | None:
@@ -570,7 +600,8 @@ class InventoryDatabase:
                         (SELECT COUNT(*) FROM items WHERE item_type='folder' AND status!='deleted') folders,
                         (SELECT COUNT(*) FROM items WHERE item_type='file' AND status!='deleted') files,
                         (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE item_type='file' AND status!='deleted') total_bytes,
-                        (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors,
+                        (SELECT COUNT(*) FROM errors WHERE resolved=0 AND COALESCE(status_code, 0) != 423) open_errors,
+                        (SELECT COUNT(DISTINCT site_id) FROM errors WHERE resolved=0 AND status_code=423) blocked_sites,
                         (SELECT MAX(updated_at) FROM drive_sync_state) last_delta_checkpoint
                     """
                 ).fetchone()
