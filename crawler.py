@@ -152,9 +152,17 @@ class InventoryCrawler:
             self.db.mark_site_processed(site.id)
             return site.id
         except GraphError as exc:
-            self.db.record_error("site", "list_site_drives", exc.message, site.id, site_id=site.id, status_code=exc.status_code, retryable=exc.status_code != 403)
-            LOGGER.exception("Erro ao listar drives do site %s", site.id)
+           if exc.status_code == 423:
+            self.db.record_error(
+                "site", "list_site_drivers_blocked", exc.message, site.id,
+                site_id=site.id, status_code=423, retryable=False,
+            )
+            LOGGER.warning("Site bloqueado (423 Locked), tratado como exclusao prevista: %s", site.web_url or site.id)
             return None
+           retryable = exc.status_code not in {401, 403, 404}
+           self.db.record_error("site", "list_site_drivers", exc.message, site.id, site_id=site.id, status_code=exc.status_code, retryable=retryable)
+           LOGGER.exception("Erro ao listar drives do site %s", site.id)
+           return None
 
     def _build_site_id_map(self) -> dict[str, dict[str, Any]]:
         LOGGER.info("Criando de/para de Site ID via /sites?search=*")
@@ -253,6 +261,7 @@ class InventoryCrawler:
                 now = time.monotonic()
                 if now - last_progress_at >= self.progress_log_interval_seconds:
                     last_files, last_folders = self._log_progress(started_at, last_progress_at, last_files, last_folders)
+                    self.db.wal_checkpoint()
                     last_progress_at = now
                 while len(futures) < target_workers:
                     drive_state = self.db.claim_delta_drive(site_ids=site_ids)
