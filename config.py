@@ -32,6 +32,8 @@ class Settings:
     site_ids_file: Path | None
     site_ids: tuple[str, ...]
     progress_log_interval_seconds: int
+    user_agent: str
+    rate_limit_min_remaining: int
     graph_base_url: str = "https://graph.microsoft.com/v1.0"
     authority_host: str = "https://login.microsoftonline.com"
 
@@ -59,6 +61,11 @@ def load_settings() -> Settings:
         site_ids_file=Path(site_ids_file_value) if site_ids_file_value else None,
         site_ids=tuple(item.strip() for item in site_ids_value.split(",") if item.strip()),
         progress_log_interval_seconds=max(10, int(os.environ.get("PROGRESS_LOG_INTERVAL_SECONDS", "60"))),
+        user_agent=(
+            os.environ.get("GRAPH_USER_AGENT", "").strip()
+            or "NONISV|SharePointStorageManager|Inventory/1.0"
+        ),
+        rate_limit_min_remaining=max(0, int(os.environ.get("RATE_LIMIT_MIN_REMAINING", "20"))),
     )
     missing = [
         name
