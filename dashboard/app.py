@@ -187,14 +187,14 @@ def render_gold_dashboard(workspace: ClientWorkspace) -> None:
             text_auto=".1f",
         )
         fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with right:
         st.subheader("Economia estimada")
         st.dataframe(
             savings.head(25).round({"current_storage_gb": 2, "archive_candidate_gb": 2, "estimated_saving_pct": 2}),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     st.divider()
@@ -202,7 +202,7 @@ def render_gold_dashboard(workspace: ClientWorkspace) -> None:
     st.dataframe(
         top_extensions.head(50).round({"storage_gb": 2}),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -266,7 +266,8 @@ def load_site_priority(site_priority_csv: str, sqlite_db: str) -> pd.DataFrame:
 
     lookup = load_site_url_lookup(sqlite_db)
     if not lookup.empty:
-        df = df.merge(lookup, how="left", left_on="site_id_lookup", right_on="site_id", suffixes=("", "_lookup"))
+        lookup = lookup.rename(columns={"site_id": "site_id_key"})
+        df = df.merge(lookup, how="left", left_on="site_id_lookup", right_on="site_id_key", suffixes=("", "_lookup"))
         df["site_url"] = df["site_url"].fillna("").astype(str)
         df["site_url"] = df["site_url"].mask(df["site_url"].isin(["", "nan", "None"]), df["site_url_lookup"].fillna(""))
         df["site_name"] = df.get("site_name", pd.Series(dtype="object")).fillna("")
@@ -277,7 +278,7 @@ def load_site_priority(site_priority_csv: str, sqlite_db: str) -> pd.DataFrame:
         df["last_activity_date"] = pd.to_datetime(df["last_activity_date"], errors="coerce")
     if "storage_used_bytes" in df.columns:
         df["storage_used_gb"] = df["storage_used_bytes"] / BYTES_IN_GB
-    df = df.drop(columns=[column for column in ["site_id_lookup", "site_url_lookup"] if column in df.columns])
+    df = df.drop(columns=[column for column in ["site_id_lookup", "site_id_key", "site_url_lookup"] if column in df.columns])
     return df
 
 
@@ -474,7 +475,7 @@ def main() -> None:
 
     with header_right:
         st.write("")
-        with st.popover("Filtros", icon=":material/filter_list:", use_container_width=True):
+        with st.popover("Filtros", icon=":material/filter_list:", width="stretch"):
             selected_sites = st.multiselect(
                 "Sites",
                 options=site_names,
@@ -516,7 +517,7 @@ def main() -> None:
             )
         )
         fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with right:
         st.subheader("Top sites")
@@ -525,7 +526,7 @@ def main() -> None:
                 ["site_name", "storage_gb", "file_count", "site_url"]
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     st.divider()
@@ -570,7 +571,7 @@ def main() -> None:
                 "site_url": "URL",
             },
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
         st.divider()
     else:
@@ -599,7 +600,7 @@ def main() -> None:
             )
         )
         fig.update_layout(height=420, margin=dict(l=8, r=16, t=48, b=20), yaxis=dict(tickfont=dict(size=12)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with ext_count_chart:
         fig = px.bar(
@@ -620,7 +621,7 @@ def main() -> None:
             )
         )
         fig.update_layout(height=420, margin=dict(l=8, r=16, t=48, b=20), yaxis=dict(tickfont=dict(size=12)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.markdown("#### Tabela por extensao")
     extension_table = extensions.copy()
@@ -644,7 +645,7 @@ def main() -> None:
             "avg_file_size_mb": "Media MB/arquivo",
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     st.divider()
@@ -682,7 +683,7 @@ def main() -> None:
             )
         )
         fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with old_col2:
         st.dataframe(
@@ -690,7 +691,7 @@ def main() -> None:
                 ["site_name", "storage_gb", "old_file_count", "site_url"]
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     with st.expander("Ver maiores arquivos antigos"):
@@ -707,7 +708,7 @@ def main() -> None:
                 ]
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     if not priority.empty:
@@ -731,7 +732,7 @@ def main() -> None:
                 ]
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info("Para exibir sites inativos, gere o arquivo exports/site_priority.csv com: python main.py prioritize-sites --period D180")

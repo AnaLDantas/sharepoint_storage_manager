@@ -398,7 +398,6 @@ class InventoryDatabase:
             )
             if clear_items:
                 item_filter, item_params = self._site_filter(site_ids)
-
                 conn.execute(f"DELETE FROM items WHERE 1=1 {item_filter}", item_params)
 
     def claim_delta_drive(self, site_ids: set[str] | None = None) -> sqlite3.Row | None:
@@ -614,7 +613,8 @@ class InventoryDatabase:
                         0 folders,
                         0 files,
                         0 total_bytes,
-                        (SELECT COUNT(*) FROM errors WHERE resolved=0) open_errors,
+                        (SELECT COUNT(*) FROM errors WHERE resolved=0 AND COALESCE(status_code, 0) != 423) open_errors,
+                        (SELECT COUNT(DISTINCT site_id) FROM errors WHERE resolved=0 AND status_code=423) blocked_sites,
                         (SELECT MAX(updated_at) FROM drive_sync_state) last_delta_checkpoint
                     """
                 ).fetchone()
