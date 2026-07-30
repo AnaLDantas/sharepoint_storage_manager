@@ -36,6 +36,9 @@ class Settings:
     rate_limit_min_remaining: int
     graph_base_url: str = "https://graph.microsoft.com/v1.0"
     authority_host: str = "https://login.microsoftonline.com"
+    # --- Coleta via PowerShell (usado nos comandos "storage") ---
+    pwsh_path: str = "pwsh"
+    spo_admin_url: str = ""  # ex.: https://contoso-admin.sharepoint.com (derivado se vazio)
 
     @property
     def authority(self) -> str:
@@ -66,6 +69,8 @@ def load_settings() -> Settings:
             or "NONISV|SharePointStorageManager|Inventory/1.0"
         ),
         rate_limit_min_remaining=max(0, int(os.environ.get("RATE_LIMIT_MIN_REMAINING", "20"))),
+        pwsh_path=os.environ.get("PWSH_PATH", "pwsh").strip() or "pwsh",
+        spo_admin_url=os.environ.get("SPO_ADMIN_URL", "").strip(),
     )
     missing = [
         name

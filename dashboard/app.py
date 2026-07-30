@@ -256,6 +256,105 @@ def load_site_url_lookup(sqlite_db: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_storage_metrics(sqlite_db: str) -> pd.DataFrame:
+    """Le site_storage_metrics (Get-SPOSite): storage total, versoes e tamanho."""
+    cols = ["site_id", "site_name", "site_url", "storage_used_bytes", "version_count", "version_size_bytes"]
+    db_path = Path(sqlite_db)
+    if not db_path.exists():
+        return pd.DataFrame(columns=cols)
+    conn = sqlite3.connect(db_path)
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='site_storage_metrics'"
+        ).fetchone()
+        if not exists:
+            return pd.DataFrame(columns=cols)
+        df = pd.read_sql_query(
+            """
+            SELECT m.site_id, COALESCE(s.name, m.site_url) AS site_name, m.site_url,
+                   m.storage_used_bytes, m.version_count, m.version_size_bytes
+            FROM site_storage_metrics m
+            LEFT JOIN sites s ON s.id = m.site_id
+            WHERE m.status = 'ok'
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    for column in ["storage_used_bytes", "version_count", "version_size_bytes"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df
+
+
+def render_versioning_section(workspace: ClientWorkspace, selected_sites: list[str]) -> None:
+    metrics = load_storage_metrics(str(workspace.sqlite_db))
+    st.subheader("Versionamento e uso real (tenant)")
+    st.caption(
+        "Storage Used vem do Get-SPOSite (inclui versoes, metadados e lixeira) e bate com o admin center. "
+        "O 'Armazenamento analisado' no topo e a soma dos streams da versao atual coletados pelo crawler."
+    )
+    if metrics.empty:
+        st.info("Rode `python main.py storage --collect` para coletar StorageUsageCurrent, VersionCount e VersionSize por site.")
+        return
+    if selected_sites:
+        metrics = metrics[metrics["site_name"].isin(selected_sites)]
+    if metrics.empty:
+        st.info("Nenhuma metrica de versao para os sites filtrados.")
+        return
+
+    total_storage = float(metrics["storage_used_bytes"].sum())
+    total_versions = float(metrics["version_count"].sum())
+    total_version_bytes = float(metrics["version_size_bytes"].sum())
+    pct = (total_version_bytes / total_storage * 100) if total_storage else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Storage Used (tenant)", format_gb(total_storage))
+    c2.metric("Espaco de versoes", format_gb(total_version_bytes))
+    c3.metric("Versoes armazenadas", format_number(total_versions))
+    c4.metric("% em versoes", f"{pct:.1f}%")
+
+    left, right = st.columns((1.15, 0.85))
+    with left:
+        st.markdown("**Top sites por espaco de versoes**")
+        top = metrics.sort_values("version_size_bytes", ascending=False).head(TOP_SITE_CHART_LIMIT).copy()
+        top["version_gb"] = top["version_size_bytes"] / BYTES_IN_GB
+        top["site_label"] = top["site_name"].map(shorten_label)
+        fig = px.bar(
+            top,
+            x="version_gb",
+            y="site_label",
+            orientation="h",
+            labels={"version_gb": "GB", "site_label": ""},
+            text_auto=".1f",
+            custom_data=["site_name", "version_count", "site_url"],
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Versoes: %{customdata[1]:,}<br>"
+                "Espaco: %{x:.2f} GB<br>"
+                "%{customdata[2]}<extra></extra>"
+            )
+        )
+        fig.update_layout(height=420, margin=dict(l=8, r=16, t=20, b=20), yaxis=dict(tickfont=dict(size=12)))
+        fig.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        st.markdown("**Detalhe por site**")
+        storage_b = metrics["storage_used_bytes"].astype("float64")
+        version_b = metrics["version_size_bytes"].astype("float64")
+        table = metrics.assign(
+            storage_gb=(storage_b / BYTES_IN_GB).round(2),
+            versoes_gb=(version_b / BYTES_IN_GB).round(2),
+            pct_versoes=((version_b / storage_b.where(storage_b > 0)) * 100).round(1),
+        ).sort_values("versoes_gb", ascending=False)[
+            ["site_name", "storage_gb", "versoes_gb", "version_count", "pct_versoes", "site_url"]
+        ]
+        st.dataframe(table, hide_index=True, use_container_width=True)
+
+
+@st.cache_data(show_spinner=False)
 def load_site_priority(site_priority_csv: str, sqlite_db: str) -> pd.DataFrame:
     priority_path = Path(site_priority_csv)
     if not priority_path.exists():
@@ -529,6 +628,9 @@ def main() -> None:
             width="stretch",
         )
 
+    st.divider()
+
+    render_versioning_section(workspace, selected_sites)
     st.divider()
 
     priority = load_site_priority(str(workspace.site_priority_csv), str(workspace.sqlite_db))

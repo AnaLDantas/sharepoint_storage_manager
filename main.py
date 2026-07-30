@@ -53,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     priority.add_argument("--period", choices=["D7", "D30", "D90", "D180"], default="D7")
     summary_parser = sub.add_parser("summary", help="Gera resumo consolidado no log/terminal")
     summary_parser.add_argument("--recalculate-folders", action="store_true", help="Recalcula agregados de pastas antes do resumo")
+    storage_parser = sub.add_parser("storage", help="Coleta rapida de storage+versoes por site via Get-SPOSite")
+    storage_parser.add_argument("--collect", action="store_true", help="Executa a coleta via Get-SPOSite")
     return parser
 
 
@@ -230,6 +232,29 @@ def prioritize_sites(period: str) -> int:
     return 0
 
 
+def storage(do_collect: bool) -> int:
+    from database import InventoryDatabase
+    from storage_collector import collect_storage_metrics
+
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    db = InventoryDatabase(settings.sqlite_db_path)
+    db.init_schema()
+
+    if not do_collect:
+        rows = db.site_storage_metrics()
+        ok = [r for r in rows if r["status"] == "ok"]
+        total_versions = sum((r["version_count"] or 0) for r in ok)
+        total_version_bytes = sum((r["version_size_bytes"] or 0) for r in ok)
+        LOGGER.info("storage: %s sites com metrica (%s ok)", len(rows), len(ok))
+        LOGGER.info("Versoes: %s | espaco de versoes: %s bytes", total_versions, total_version_bytes)
+        return 0
+
+    result = collect_storage_metrics(settings, db)
+    LOGGER.info("storage collect: %s", result)
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.command in {"crawl", "resume"}:
@@ -244,6 +269,8 @@ def main() -> int:
         return summary(args.recalculate_folders)
     if args.command == "prioritize-sites":
         return prioritize_sites(args.period)
+    if args.command == "storage":
+        return storage(args.collect)
     return 2
 
 

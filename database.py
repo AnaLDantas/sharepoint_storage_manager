@@ -162,6 +162,17 @@ class InventoryDatabase:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS site_storage_metrics (
+                    site_id TEXT PRIMARY KEY,
+                    site_url TEXT,
+                    storage_used_bytes INTEGER,
+                    version_count INTEGER,
+                    version_size_bytes INTEGER,
+                    status TEXT,
+                    message TEXT,
+                    collected_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_drive_sync_status ON drive_sync_state(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_errors_retry ON errors(resolved, retryable);
                 -- Indice parcial minusculo: serve drive_root_path() sem varrer items inteira.
@@ -193,6 +204,56 @@ class InventoryDatabase:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.OperationalError as exc:
                 LOGGER.debug("wal_checkpoint ignorado: %s", exc)
+
+    # ---- Metricas de storage/versao via Get-SPOSite -------------------------
+
+    def all_sites(self) -> list[sqlite3.Row]:
+        """Todos os sites descobertos (id + web_url)."""
+        with self._lock:
+            return self.conn.execute(
+                "SELECT id, web_url FROM sites WHERE web_url IS NOT NULL AND web_url != '' ORDER BY name"
+            ).fetchall()
+
+    def upsert_site_storage_metric(
+        self,
+        site_id: str,
+        site_url: str,
+        storage_used_bytes: int | None,
+        version_count: int | None,
+        version_size_bytes: int | None,
+        status: str,
+        message: str | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO site_storage_metrics
+                    (site_id, site_url, storage_used_bytes, version_count, version_size_bytes, status, message, collected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(site_id) DO UPDATE SET
+                    site_url=excluded.site_url,
+                    storage_used_bytes=excluded.storage_used_bytes,
+                    version_count=excluded.version_count,
+                    version_size_bytes=excluded.version_size_bytes,
+                    status=excluded.status,
+                    message=excluded.message,
+                    collected_at=excluded.collected_at
+                """,
+                (site_id, site_url, storage_used_bytes, version_count, version_size_bytes, status, message, utc_now()),
+            )
+
+    def site_storage_metrics(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                """
+                SELECT m.site_id, s.name AS site_name, m.site_url,
+                       m.storage_used_bytes, m.version_count, m.version_size_bytes,
+                       m.status, m.message, m.collected_at
+                FROM site_storage_metrics m
+                LEFT JOIN sites s ON s.id = m.site_id
+                ORDER BY COALESCE(m.version_size_bytes, 0) DESC
+                """
+            ).fetchall()
 
     def start_run(self, command: str) -> int:
         with self.transaction() as conn:
